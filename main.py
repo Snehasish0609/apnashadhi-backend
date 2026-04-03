@@ -37,9 +37,7 @@ async def on_startup():
         result = await conn.execute(text("SELECT current_database();"))
         print("Connected to DB:", result.scalar())
 
-        # ⚠️ COMMENT THESE OUT IF YOUR DB IS ALREADY WORKING!
-        # await conn.run_sync(Base.metadata.drop_all)
-        # await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(Base.metadata.create_all)  # ✅ ENABLE THIS
 
         print("Database tables ensured!")
 
