@@ -11,8 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text, select, or_, and_
 
 from db import engine, SessionLocal
-from models import Base, User, Message, Interaction
-from schemas import RegisterUser, LoginUser, UserResponse, MessageCreate, UpdateUser, InteractionCreate , MatchmakerQuizParams
+# Added Referral and Transaction from intern's code
+from models import Base, User, Message, Interaction, Referral, Transaction
+# Added intern's wallet schemas
+from schemas import RegisterUser, LoginUser, UserResponse, MessageCreate, UpdateUser, InteractionCreate, MatchmakerQuizParams, TransactionOut, ReferralHistoryItem, WalletInfo
 from crud import (
     create_user,
     authenticate_user,
@@ -155,7 +157,41 @@ async def update_profile(
     await db.commit()
     await db.refresh(user)
 
-    return {"message": "Profile updated successfully"}
+    # ── Intern's update: Auto-recalculate profile completion & fire referral reward ──
+    from crud import calculate_profile_score
+    new_score = calculate_profile_score(user)
+    if user.profile_completed != new_score:
+        user.profile_completed = new_score
+        await db.commit()
+        await db.refresh(user)
+
+    # If user just hit 100%, try to credit their referrer
+    if user.profile_completed >= 100:
+        ref_result = await db.execute(
+            select(Referral).where(
+                Referral.referred_id == user_id,
+                Referral.reward_given == False,
+            )
+        )
+        ref_row = ref_result.scalars().first()
+        if ref_row:
+            coins = 10
+            done_count_res = await db.execute(
+                select(Referral).where(
+                    Referral.referrer_id == ref_row.referrer_id,
+                    Referral.reward_given == True,
+                )
+            )
+            done_count = len(done_count_res.scalars().all())
+            if done_count + 1 == 5:
+                coins += 20
+            elif done_count + 1 == 10:
+                coins += 50
+            await _credit_coins(db, ref_row.referrer_id, coins, f"Referral reward: {coins} Apna Coins")
+            ref_row.reward_given = True
+            await db.commit()
+
+    return {"message": "Profile updated successfully", "profile_completed": user.profile_completed}
 
 # =====================
 # PROFILE PIC UPLOAD 🔥
@@ -236,6 +272,74 @@ def calculate_match_percentage(current_user, target_user):
         score += 10 
         
     return max(score, 10) if score > 0 else 0
+
+# ── Intern's Matchmaking Search Route ──
+@app.post("/matchmaking/search")
+async def search_matches(
+    filters: dict,
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user)
+):
+    current_user_res = await db.execute(select(User).where(User.id == user_id))
+    current_user = current_user_res.scalars().first()
+
+    # Get interacted IDs to exclude
+    interactions_res = await db.execute(
+        select(Interaction.target_id)
+        .where(
+            Interaction.user_id == user_id,
+            Interaction.action.in_(['interest', 'reject'])
+        )
+    )
+    interacted_ids = interactions_res.scalars().all()
+
+    # Build dynamic query
+    query = select(User).where(User.id != user_id)
+    if interacted_ids:
+        query = query.where(User.id.notin_(interacted_ids))
+
+    # Apply filters
+    min_age = filters.get("min_age")
+    max_age = filters.get("max_age")
+    religion = filters.get("religion")
+    city = filters.get("city")
+    gender = filters.get("gender") # Optional gender filter
+
+    if gender:
+        query = query.where(User.gender.ilike(gender))
+    
+    # Age filter (calculated from date_of_birth)
+    if min_age or max_age:
+        today = date.today()
+        if min_age:
+            min_dob = date(today.year - int(min_age), today.month, today.day)
+            query = query.where(User.date_of_birth <= min_dob)
+        if max_age:
+            max_dob = date(today.year - int(max_age) - 1, today.month, today.day)
+            query = query.where(User.date_of_birth > max_dob)
+
+    if religion:
+        query = query.where(User.religion.ilike(religion))
+    
+    if city:
+        query = query.where(User.city.ilike(f"%{city}%"))
+
+    users_res = await db.execute(query)
+    found_users = users_res.scalars().all()
+
+    results = []
+    for u in found_users:
+        match_pct = calculate_match_percentage(current_user, u)
+        user_data = u.__dict__.copy()
+        user_data.pop("_sa_instance_state", None)
+        user_data.pop("password", None)
+        user_data["match_percentage"] = match_pct
+        user_data["match_reason"] = "Search Result" if match_pct < 90 else "Top Match 🌟"
+        results.append(user_data)
+
+    # Sort by match percentage
+    results.sort(key=lambda x: x["match_percentage"], reverse=True)
+    return results
 
 @app.get("/matchmaking/suggested")
 async def get_suggested_matches(
@@ -627,7 +731,7 @@ async def get_public_profile(
 
 
 # =====================
-# FREE "AI" QUIZ SEARCH
+# FREE "AI" QUIZ SEARCH 🔥 (Intern Updated)
 # =====================
 @app.post("/ai-matchmaker/quiz-search")
 async def ai_quiz_search(
@@ -635,46 +739,206 @@ async def ai_quiz_search(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user)
 ):
-    # Start the query, excluding the user themselves
-    query = select(User).where(User.id != user_id)
-    
     ans = data.answers
-    
-    # Dynamically build the search query based on what the user answered
-    if ans.get("city"):
-        query = query.where(User.city.ilike(f"%{ans['city']}%"))
-    if ans.get("profession"):
-        query = query.where(User.profession.ilike(f"%{ans['profession']}%"))
-    if ans.get("religion"):
-        query = query.where(User.religion.ilike(f"%{ans['religion']}%"))
-    if ans.get("caste"):
-        query = query.where(User.caste.ilike(f"%{ans['caste']}%"))
-    if ans.get("diet"):
-        query = query.where(User.diet.ilike(f"%{ans['diet']}%"))
-    if ans.get("marital_status"):
-        query = query.where(User.marital_status.ilike(f"%{ans['marital_status']}%"))
-    if ans.get("education"):
-        query = query.where(User.education.ilike(f"%{ans['education']}%"))
-    if ans.get("mother_tongue"):
-        query = query.where(User.mother_tongue.ilike(f"%{ans['mother_tongue']}%"))
-    if ans.get("habits"):
-        query = query.where(User.habits.ilike(f"%{ans['habits']}%"))
-    if ans.get("family_type"):
-        query = query.where(User.family_type.ilike(f"%{ans['family_type']}%"))
+    base = select(User).where(User.id != user_id)
 
-    # Execute the search
-    result = await db.execute(query)
+    # ── Helper: build query applying only the chosen filter fields ────
+    def build_query(fields):
+        q = base
+        if "city" in fields and ans.get("city"):
+            q = q.where(User.city.ilike(f"%{ans['city']}%"))
+        if "religion" in fields and ans.get("religion"):
+            q = q.where(User.religion.ilike(f"%{ans['religion']}%"))
+        if "profession" in fields and ans.get("profession"):
+            q = q.where(User.profession.ilike(f"%{ans['profession']}%"))
+        if "caste" in fields and ans.get("caste"):
+            q = q.where(User.caste.ilike(f"%{ans['caste']}%"))
+        if "diet" in fields and ans.get("diet"):
+            q = q.where(User.diet.ilike(f"%{ans['diet']}%"))
+        if "marital_status" in fields and ans.get("marital_status"):
+            q = q.where(User.marital_status.ilike(f"%{ans['marital_status']}%"))
+        if "education" in fields and ans.get("education"):
+            q = q.where(User.education.ilike(f"%{ans['education']}%"))
+        if "mother_tongue" in fields and ans.get("mother_tongue"):
+            q = q.where(User.mother_tongue.ilike(f"%{ans['mother_tongue']}%"))
+        if "habits" in fields and ans.get("habits"):
+            q = q.where(User.habits.ilike(f"%{ans['habits']}%"))
+        if "family_type" in fields and ans.get("family_type"):
+            q = q.where(User.family_type.ilike(f"%{ans['family_type']}%"))
+        return q
+
+    ALL_FIELDS  = ["city","religion","profession","caste","diet",
+                   "marital_status","education","mother_tongue","habits","family_type"]
+    SOFT_FIELDS = ["city","religion"]   # most important two only
+
+    # Pass 1 — strict: ALL selected filters AND together
+    result = await db.execute(build_query(ALL_FIELDS))
     matches = result.scalars().all()
-    
-    # Strip passwords and format for frontend
+
+    # Pass 2 — relaxed: keep only city + religion
+    if not matches:
+        result = await db.execute(build_query(SOFT_FIELDS))
+        matches = result.scalars().all()
+
+    # Pass 3 — broadest: no preference filters, just exclude self
+    if not matches:
+        result = await db.execute(base)
+        matches = result.scalars().all()
+
     safe_matches = []
-    for u in matches[:10]: # Return top 10 matches
+    for u in matches[:10]:
         user_data = u.__dict__.copy()
         user_data.pop("_sa_instance_state", None)
         user_data.pop("password", None)
-        
-        # Give them an arbitrary high match percentage since they match the keywords
         user_data["match_percentage"] = 95
         safe_matches.append(user_data)
-        
+
     return {"suggested_profiles": safe_matches}
+
+# =====================================================================
+# REFERRAL & WALLET SYSTEM (Intern Added)
+# =====================================================================
+
+async def _credit_coins(db, user_id: int, amount: int, description: str):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalars().first()
+    if user:
+        user.coin_balance = (user.coin_balance or 0) + amount
+        txn = Transaction(user_id=user_id, amount=amount, description=description)
+        db.add(txn)
+
+
+@app.get("/referral/validate/{code}")
+async def validate_referral_code(code: str, db=Depends(get_db)):
+    result = await db.execute(select(User).where(User.referral_code == code.upper()))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Invalid referral code")
+    return {"valid": True, "referrer_name": user.first_name, "code": user.referral_code}
+
+
+@app.get("/referral/my-code")
+async def get_my_referral_code(db: AsyncSession = Depends(get_db), user_id: int = Depends(get_current_user)):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "referral_code": user.referral_code,
+        "share_link": f"https://apnasaadhi.com/register?ref={user.referral_code}",
+        "local_link": f"http://localhost:5173/register?ref={user.referral_code}",
+        "coin_balance": user.coin_balance or 0,
+    }
+
+
+@app.get("/referral/history")
+async def get_referral_history(db: AsyncSession = Depends(get_db), user_id: int = Depends(get_current_user)):
+    refs_result = await db.execute(select(Referral).where(Referral.referrer_id == user_id))
+    refs = refs_result.scalars().all()
+    history = []
+    for ref in refs:
+        ru = (await db.execute(select(User).where(User.id == ref.referred_id))).scalars().first()
+        if ru:
+            status = "Completed" if (ru.profile_completed or 0) >= 100 else "Pending"
+            history.append({
+                "referred_name": f"{ru.first_name} {ru.last_name}",
+                "status": status,
+                "coins_earned": 10 if ref.reward_given else 0,
+                "profile_completion": ru.profile_completed or 0,
+            })
+    total_completed = sum(1 for h in history if h["status"] == "Completed")
+    total_earned = sum(h["coins_earned"] for h in history)
+    return {
+        "history": history,
+        "total_referrals": len(history),
+        "successful_referrals": total_completed,
+        "total_coins_earned_from_referrals": total_earned,
+    }
+
+
+@app.post("/referral/check-reward")
+async def check_and_grant_referral_reward(db: AsyncSession = Depends(get_db), user_id: int = Depends(get_current_user)):
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    user = user_result.scalars().first()
+    if not user or (user.profile_completed or 0) < 100:
+        return {"rewarded": False, "message": "Profile not yet 100%"}
+    ref_result = await db.execute(
+        select(Referral).where(Referral.referred_id == user_id, Referral.reward_given == False)
+    )
+    ref_row = ref_result.scalars().first()
+    if not ref_row:
+        return {"rewarded": False, "message": "No pending referral reward"}
+    coins = 10
+    done_count_res = await db.execute(
+        select(Referral).where(Referral.referrer_id == ref_row.referrer_id, Referral.reward_given == True)
+    )
+    done_count = len(done_count_res.scalars().all())
+    if done_count + 1 == 5:
+        coins += 20
+    elif done_count + 1 == 10:
+        coins += 50
+    await _credit_coins(db, ref_row.referrer_id, coins, f"Referral reward: {coins} Apna Coins")
+    ref_row.reward_given = True
+    await db.commit()
+    return {"rewarded": True, "coins_awarded": coins}
+
+
+@app.get("/wallet/info")
+async def get_wallet_info(db: AsyncSession = Depends(get_db), user_id: int = Depends(get_current_user)):
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    user = user_result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    txn_result = await db.execute(
+        select(Transaction).where(Transaction.user_id == user_id).order_by(Transaction.created_at.desc())
+    )
+    txns = txn_result.scalars().all()
+    total_earned = sum(t.amount for t in txns if t.amount > 0)
+    total_spent = abs(sum(t.amount for t in txns if t.amount < 0))
+    return {
+        "coin_balance": user.coin_balance or 0,
+        "total_earned": total_earned,
+        "total_spent": total_spent,
+        "transactions": [
+            {"id": t.id, "amount": t.amount, "description": t.description,
+             "created_at": t.created_at.isoformat() if t.created_at else ""}
+            for t in txns
+        ],
+    }
+
+
+@app.post("/wallet/spend")
+async def spend_coins(payload: dict, db: AsyncSession = Depends(get_db), user_id: int = Depends(get_current_user)):
+    amount = int(payload.get("amount", 0))
+    description = payload.get("description", "Coins spent")
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    user = user_result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if (user.coin_balance or 0) < amount:
+        raise HTTPException(status_code=400, detail="Insufficient coin balance")
+    user.coin_balance -= amount
+    txn = Transaction(user_id=user_id, amount=-amount, description=description)
+    db.add(txn)
+    await db.commit()
+    return {"message": "Coins deducted", "new_balance": user.coin_balance}
+
+
+@app.get("/referral/leaderboard")
+async def referral_leaderboard(db: AsyncSession = Depends(get_db), user_id: int = Depends(get_current_user)):
+    from collections import Counter
+    refs_res = await db.execute(select(Referral.referrer_id).where(Referral.reward_given == True))
+    counts = Counter(refs_res.scalars().all())
+    board = []
+    for rid, cnt in counts.most_common(10):
+        u = (await db.execute(select(User).where(User.id == rid))).scalars().first()
+        if u:
+            board.append({
+                "name": u.first_name,
+                "referrals": cnt,
+                "coins": u.coin_balance or 0,
+                "level": "Ambassador" if cnt >= 50 else "Pro" if cnt >= 10 else "Beginner",
+            })
+    return {"leaderboard": board}
