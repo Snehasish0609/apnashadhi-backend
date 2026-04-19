@@ -11,6 +11,7 @@ class RegisterUser(BaseModel):
     password: str = Field(min_length=6)
     date_of_birth: date
     city: str
+    state: str | None = None
     profession: str
 
     # =====================
@@ -18,6 +19,9 @@ class RegisterUser(BaseModel):
     # =====================
     gender: str | None = None
     looking_for: str | None = None
+    relationship_type: str | None = None  # Serious / Casual / Marriage
+    account_created_by: str | None = None  # Self / Parents / Guardian
+    terms_accepted: bool | None = False
 
     preferred_min_age: int | None = None
     preferred_max_age: int | None = None
@@ -82,8 +86,12 @@ class UpdateUser(BaseModel):
     habits: str | None = None
     hobbies: str | None = None
     bio: str | None = None
+    # New fields from enhanced registration
+    state: str | None = None
+    relationship_type: str | None = None
+    account_created_by: str | None = None
 
-    
+
 class LoginUser(BaseModel):
     email: str | None = None
     mobile_no: str | None = None
@@ -99,7 +107,6 @@ class UserResponse(BaseModel):
     class Config:
         from_attributes = True
 
-
 class UserOut(BaseModel):
     id: int
     first_name: str
@@ -107,26 +114,32 @@ class UserOut(BaseModel):
     profile_pic: str | None = None
     city: str | None = None
     profession: str | None = None
+    
+    # Added for Chat Presence
+    is_online: bool = False
+    last_seen: datetime | None = None
 
     class Config:
         from_attributes = True
-
 
 class MessageCreate(BaseModel):
     receiver_id: int
-    message: str
-
+    message: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
 
 class MessageOut(BaseModel):
-    id: int # Added ID
+    id: int
     sender_id: int
     receiver_id: int
-    message: str
-    created_at: datetime # Changed to datetime for proper serialization
+    message: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
+    status: str
+    created_at: datetime
 
     class Config:
         from_attributes = True
-
 # ADDED: Full support for profile visits, interests, and rejects
 class InteractionCreate(BaseModel):
     target_id: int
@@ -161,3 +174,67 @@ class WalletInfo(BaseModel):
     total_earned: int
     total_spent: int
     transactions: List[TransactionOut]
+
+
+# =====================================================================
+# PROFILE VISIBILITY SCHEMA
+# =====================================================================
+class ProfileVisibilityUpdate(BaseModel):
+    profile_visibility: str  # "public" | "matches_only" | "premium_only"
+
+    @validator("profile_visibility")
+    def validate_visibility(cls, v):
+        allowed = {"public", "matches_only", "premium_only"}
+        if v not in allowed:
+            raise ValueError(f"profile_visibility must be one of {allowed}")
+        return v
+
+# =====================================================================
+# OTP EMAIL VERIFICATION SCHEMAS
+# =====================================================================
+
+class OTPRequest(BaseModel):
+    """Body sent by frontend when requesting a new OTP."""
+    email: EmailStr
+
+
+class OTPVerify(BaseModel):
+    """Body sent by frontend to verify the OTP entered by the user."""
+    email: EmailStr
+    otp: str = Field(min_length=6, max_length=6)
+
+
+
+# =====================================================================
+# SUPPORT TICKET SCHEMAS
+# =====================================================================
+
+class SupportTicketCreate(BaseModel):
+    """
+    Matches the exact field names sent by Support.jsx NewTicketTab:
+      user        -> email
+      priority    -> urgency
+      description -> issue
+    """
+    email:    EmailStr = Field(alias="user")         # JSX sends 'user' for the email field
+    subject:  str      = Field(min_length=1, max_length=500)
+    category: str      = Field(min_length=1, max_length=100)
+    urgency:  str      = Field(default="medium", max_length=50, alias="priority")  # JSX sends 'priority'
+    issue:    str      = Field(min_length=1, alias="description")  # JSX sends 'description'
+
+    class Config:
+        populate_by_name = True   # allow both alias and field name
+
+
+class SupportTicketOut(BaseModel):
+    id:             int
+    email:          str
+    subject:        str
+    category:       str
+    urgency:        str
+    issue:          str
+    email_verified: bool
+    created_at:     datetime
+
+    class Config:
+        from_attributes = True

@@ -1,9 +1,10 @@
 import random
 import string
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from models import User, Message, Referral, Transaction
+from sqlalchemy import select, update, func, and_, or_
+from models import User, Message, Referral, Transaction,SupportTicket
 from auth import hash_password, verify_password
+import os
 
 # =====================
 # USERS
@@ -80,6 +81,7 @@ async def create_user(db: AsyncSession, user):
         email=user.email,
         mobile_no=user.mobile_no,
         city=user.city,
+        state=getattr(user, 'state', None),
         profession=user.profession,
         date_of_birth=user.date_of_birth,
         password=hash_password(user.password),
@@ -100,11 +102,17 @@ async def create_user(db: AsyncSession, user):
         bio=user.bio,
         gender=user.gender,
         looking_for=user.looking_for,
+        relationship_type=getattr(user, 'relationship_type', None),
         profile_pic=None,
         preferred_min_age=user.preferred_min_age,
         preferred_max_age=user.preferred_max_age,
         preferred_city=user.preferred_city,
         preferred_religion=user.preferred_religion,
+
+        # Registration metadata
+        account_created_by=getattr(user, 'account_created_by', None),
+        terms_accepted=getattr(user, 'terms_accepted', False) or False,
+        is_active=True,  # Admin must activate the account
 
         # Referral & Wallet Initialization
         referral_code=new_code,
@@ -142,39 +150,87 @@ async def get_all_users(db: AsyncSession, current_user_id: int):
     )
     return result.scalars().all()
 
-
-# =====================
-# CHAT
-# =====================
+# Define your secret key for encryption (store this in .env)
+PG_SECRET = os.getenv("PG_SECRET_KEY", "Apnashaadi.in123")
 
 async def save_message(
-    db: AsyncSession,
-    sender_id: int,
-    receiver_id: int,
-    message: str,
+    db: AsyncSession, 
+    sender_id: int, 
+    receiver_id: int, 
+    message: str = None, 
+    media_url: str = None, 
+    media_type: str = None
 ):
+    # Encrypt the text message before saving
+    encrypted_msg = func.pgp_sym_encrypt(message, PG_SECRET) if message else None
+
     msg = Message(
         sender_id=sender_id,
         receiver_id=receiver_id,
-        message=message,
+        message=encrypted_msg,
+        media_url=media_url,
+        media_type=media_type,
+        status="sent" # Default status
     )
     db.add(msg)
     await db.commit()
     await db.refresh(msg)
-    return msg
-
+    
+    # Fetch it back to return the decrypted string to the immediate sender
+    return {
+        "id": msg.id,
+        "sender_id": msg.sender_id,
+        "receiver_id": msg.receiver_id,
+        "message": message,
+        "media_url": msg.media_url,
+        "media_type": msg.media_type,
+        "status": msg.status,
+        "created_at": msg.created_at
+    }
 
 async def get_messages(db: AsyncSession, user1: int, user2: int):
+    # Decrypt on read
     result = await db.execute(
-        select(Message)
+        select(
+            Message.id,
+            Message.sender_id,
+            Message.receiver_id,
+            func.pgp_sym_decrypt(Message.message, PG_SECRET).label("message"),
+            Message.media_url,
+            Message.media_type,
+            Message.status,
+            Message.created_at
+        )
         .where(
             ((Message.sender_id == user1) & (Message.receiver_id == user2)) |
             ((Message.sender_id == user2) & (Message.receiver_id == user1))
         )
         .order_by(Message.created_at)
     )
-    return result.scalars().all()
+    return [dict(r._mapping) for r in result.all()]
 
+async def mark_messages_as_seen(db: AsyncSession, sender_id: int, receiver_id: int):
+    # Marks messages sent by 'sender_id' and received by 'receiver_id' as seen
+    await db.execute(
+        update(Message)
+        .where(
+            and_(
+                Message.sender_id == sender_id, 
+                Message.receiver_id == receiver_id, 
+                Message.status != "seen"
+            )
+        )
+        .values(status="seen")
+    )
+    await db.commit()
+
+async def update_user_presence(db: AsyncSession, user_id: int, is_online: bool):
+    await db.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(is_online=is_online, last_seen=func.now())
+    )
+    await db.commit()
 # =====================
 # WALLET HELPERS
 # =====================
@@ -189,3 +245,38 @@ async def credit_coins(db: AsyncSession, user_id: int, amount: int, description:
         db.add(txn)
         return True
     return False
+
+
+# =====================
+# SUPPORT TICKETS
+# =====================
+
+async def create_support_ticket(
+    db: AsyncSession,
+    email: str,
+    subject: str,
+    category: str,
+    urgency: str,
+    issue: str,
+) -> SupportTicket:
+    """
+    Persists a new support ticket.
+    Automatically checks whether the submitted email belongs to a
+    registered (= verified) user and sets email_verified accordingly.
+    """
+    # Check if the email is linked to a registered user
+    user_result = await db.execute(select(User).where(User.email == email.lower().strip()))
+    email_verified = user_result.scalars().first() is not None
+
+    ticket = SupportTicket(
+        email=email.lower().strip(),
+        subject=subject,
+        category=category,
+        urgency=urgency,
+        issue=issue,
+        email_verified=email_verified,
+    )
+    db.add(ticket)
+    await db.commit()
+    await db.refresh(ticket)
+    return ticket
