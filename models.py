@@ -87,6 +87,11 @@ class Message(Base):
     status = Column(String, default="sent") 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # 🔥 NEW: Soft Delete Flags
+    is_deleted = Column(Boolean, default=False, server_default="false")
+    deleted_by_sender = Column(Boolean, default=False, server_default="false")
+    deleted_by_receiver = Column(Boolean, default=False, server_default="false")
+
 class Interaction(Base):
     __tablename__ = "interactions"
     id = Column(Integer, primary_key=True, index=True)
@@ -111,7 +116,6 @@ class BlockedUser(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     __table_args__ = (UniqueConstraint("user_id", "blocked_user_id"),)
 
-
 class Report(Base):
     __tablename__ = "reports"
     id = Column(Integer, primary_key=True, index=True)
@@ -120,7 +124,6 @@ class Report(Base):
     reason = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-
 class Transaction(Base):
     __tablename__ = "transactions"
     id = Column(Integer, primary_key=True, index=True)
@@ -128,7 +131,6 @@ class Transaction(Base):
     amount = Column(Integer, nullable=False) # +ve credit, -ve debit
     description = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
     
 class OTPCode(Base):
     """
@@ -143,7 +145,6 @@ class OTPCode(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)
     is_used = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
 
 class SupportTicket(Base):
     """

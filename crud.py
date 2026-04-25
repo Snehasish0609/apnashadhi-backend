@@ -2,7 +2,7 @@ import random
 import string
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func, and_, or_
-from models import User, Message, Referral, Transaction,SupportTicket
+from models import User, Message, Referral, Transaction, SupportTicket, BlockedUser
 from auth import hash_password, verify_password
 import os
 
@@ -16,45 +16,27 @@ async def get_user_by_email(db: AsyncSession, email: str):
     )
     return result.scalars().first()
 
-
 async def get_user_by_mobile(db: AsyncSession, mobile: str):
     result = await db.execute(
         select(User).where(User.mobile_no == mobile)
     )
     return result.scalars().first()
 
-
 def calculate_profile_score(user):
     fields = [
-        user.height,
-        user.marital_status,
-        user.education,
-        user.annual_income,
-        user.religion,
-        user.caste,
-        user.mother_tongue,
-        user.family_type,
-        user.family_values,
-        user.diet,
-        user.habits,
-        user.hobbies,
-        user.bio,
-        user.gender,
-        user.looking_for,
-        user.preferred_min_age,
-        user.preferred_max_age,
-        user.preferred_city,
-        user.preferred_religion,
+        user.height, user.marital_status, user.education, user.annual_income,
+        user.religion, user.caste, user.mother_tongue, user.family_type,
+        user.family_values, user.diet, user.habits, user.hobbies, user.bio,
+        user.gender, user.looking_for, user.preferred_min_age,
+        user.preferred_max_age, user.preferred_city, user.preferred_religion,
     ]
     filled = sum(1 for f in fields if f is not None and f != "")
     return int((filled / len(fields)) * 100)
 
-
-# ✅ NEW: Referral Code Generator
 async def generate_unique_referral_code(db: AsyncSession, first_name: str) -> str:
     """Create a short, unique referral code like RAHUL5X."""
     base = first_name.upper()[:5]
-    for _ in range(10):  # Try 10 times to find a unique suffix
+    for _ in range(10):  
         suffix = ''.join(random.choices(string.digits + string.ascii_uppercase, k=3))
         code = f"{base}{suffix}"
         existing = await db.execute(select(User).where(User.referral_code == code))
@@ -62,9 +44,7 @@ async def generate_unique_referral_code(db: AsyncSession, first_name: str) -> st
             return code
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
-
 async def create_user(db: AsyncSession, user):
-    # 1. Resolve referrer if a code was provided
     referrer = None
     if getattr(user, 'referred_by_code', None):
         ref_result = await db.execute(
@@ -72,60 +52,32 @@ async def create_user(db: AsyncSession, user):
         )
         referrer = ref_result.scalars().first()
 
-    # 2. Generate new user's code
     new_code = await generate_unique_referral_code(db, user.first_name)
 
     db_user = User(
-        first_name=user.first_name,
-        last_name=user.last_name,
-        email=user.email,
-        mobile_no=user.mobile_no,
-        city=user.city,
-        state=getattr(user, 'state', None),
-        profession=user.profession,
-        date_of_birth=user.date_of_birth,
-        password=hash_password(user.password),
-
-        # Optional Fields
-        height=user.height,
-        marital_status=user.marital_status,
-        education=user.education,
-        annual_income=user.annual_income,
-        religion=user.religion,
-        caste=user.caste,
-        mother_tongue=user.mother_tongue,
-        family_type=user.family_type,
-        family_values=user.family_values,
-        diet=user.diet,
-        habits=user.habits,
-        hobbies=user.hobbies,
-        bio=user.bio,
-        gender=user.gender,
-        looking_for=user.looking_for,
-        relationship_type=getattr(user, 'relationship_type', None),
-        profile_pic=None,
-        preferred_min_age=user.preferred_min_age,
-        preferred_max_age=user.preferred_max_age,
-        preferred_city=user.preferred_city,
-        preferred_religion=user.preferred_religion,
-
-        # Registration metadata
+        first_name=user.first_name, last_name=user.last_name, email=user.email,
+        mobile_no=user.mobile_no, city=user.city, state=getattr(user, 'state', None),
+        profession=user.profession, date_of_birth=user.date_of_birth,
+        password=hash_password(user.password), height=user.height,
+        marital_status=user.marital_status, education=user.education,
+        annual_income=user.annual_income, religion=user.religion, caste=user.caste,
+        mother_tongue=user.mother_tongue, family_type=user.family_type,
+        family_values=user.family_values, diet=user.diet, habits=user.habits,
+        hobbies=user.hobbies, bio=user.bio, gender=user.gender,
+        looking_for=user.looking_for, relationship_type=getattr(user, 'relationship_type', None),
+        preferred_min_age=user.preferred_min_age, preferred_max_age=user.preferred_max_age,
+        preferred_city=user.preferred_city, preferred_religion=user.preferred_religion,
         account_created_by=getattr(user, 'account_created_by', None),
         terms_accepted=getattr(user, 'terms_accepted', False) or False,
-        is_active=True,  # Admin must activate the account
-
-        # Referral & Wallet Initialization
-        referral_code=new_code,
-        referred_by=referrer.id if referrer else None,
-        coin_balance=0,
+        is_active=True, referral_code=new_code,
+        referred_by=referrer.id if referrer else None, coin_balance=0,
     )
 
     db_user.profile_completed = calculate_profile_score(db_user)
 
     db.add(db_user)
-    await db.flush()  # To get db_user.id for the Referral table
+    await db.flush()
 
-    # 3. Log the referral relationship
     if referrer:
         new_referral = Referral(referrer_id=referrer.id, referred_id=db_user.id)
         db.add(new_referral)
@@ -133,7 +85,6 @@ async def create_user(db: AsyncSession, user):
     await db.commit()
     await db.refresh(db_user)
     return db_user
-
 
 async def authenticate_user(db: AsyncSession, email: str, password: str):
     user = await get_user_by_email(db, email)
@@ -143,81 +94,83 @@ async def authenticate_user(db: AsyncSession, email: str, password: str):
         return None
     return user
 
-
 async def get_all_users(db: AsyncSession, current_user_id: int):
-    result = await db.execute(
-        select(User).where(User.id != current_user_id)
+    # Fetch blocks to apply masks
+    blocks_res = await db.execute(
+        select(BlockedUser).where(
+            or_(BlockedUser.user_id == current_user_id, BlockedUser.blocked_user_id == current_user_id)
+        )
     )
-    return result.scalars().all()
+    blocked_ids = {b.blocked_user_id if b.user_id == current_user_id else b.user_id for b in blocks_res.scalars().all()}
 
-# Define your secret key for encryption (store this in .env)
+    result = await db.execute(select(User).where(User.id != current_user_id))
+    users = result.scalars().all()
+    
+    safe_users = []
+    for u in users:
+        user_data = u.__dict__.copy()
+        user_data.pop("_sa_instance_state", None)
+        user_data.pop("password", None)
+        
+        # 🔥 Mask presence if blocked
+        if u.id in blocked_ids:
+            user_data["is_blocked"] = True
+            user_data["is_online"] = False
+            user_data["last_seen"] = None
+        else:
+            user_data["is_blocked"] = False
+            
+        safe_users.append(user_data)
+        
+    return safe_users
+
 PG_SECRET = os.getenv("PG_SECRET_KEY", "Apnashaadi.in123")
 
 async def save_message(
-    db: AsyncSession, 
-    sender_id: int, 
-    receiver_id: int, 
-    message: str = None, 
-    media_url: str = None, 
-    media_type: str = None
+    db: AsyncSession, sender_id: int, receiver_id: int, 
+    message: str = None, media_url: str = None, media_type: str = None
 ):
-    # Encrypt the text message before saving
     encrypted_msg = func.pgp_sym_encrypt(message, PG_SECRET) if message else None
 
     msg = Message(
-        sender_id=sender_id,
-        receiver_id=receiver_id,
-        message=encrypted_msg,
-        media_url=media_url,
-        media_type=media_type,
-        status="sent" # Default status
+        sender_id=sender_id, receiver_id=receiver_id, message=encrypted_msg,
+        media_url=media_url, media_type=media_type, status="sent"
     )
     db.add(msg)
     await db.commit()
     await db.refresh(msg)
     
-    # Fetch it back to return the decrypted string to the immediate sender
     return {
-        "id": msg.id,
-        "sender_id": msg.sender_id,
-        "receiver_id": msg.receiver_id,
-        "message": message,
-        "media_url": msg.media_url,
-        "media_type": msg.media_type,
-        "status": msg.status,
-        "created_at": msg.created_at
+        "id": msg.id, "sender_id": msg.sender_id, "receiver_id": msg.receiver_id,
+        "message": message, "media_url": msg.media_url, "media_type": msg.media_type,
+        "status": msg.status, "created_at": msg.created_at
     }
 
 async def get_messages(db: AsyncSession, user1: int, user2: int):
-    # Decrypt on read
+    # 🔥 FIXED: Ensure we drop messages that the user marked as "deleted for me"
     result = await db.execute(
         select(
-            Message.id,
-            Message.sender_id,
-            Message.receiver_id,
+            Message.id, Message.sender_id, Message.receiver_id,
             func.pgp_sym_decrypt(Message.message, PG_SECRET).label("message"),
-            Message.media_url,
-            Message.media_type,
-            Message.status,
-            Message.created_at
+            Message.media_url, Message.media_type, Message.status,
+            Message.created_at, Message.is_deleted
         )
         .where(
-            ((Message.sender_id == user1) & (Message.receiver_id == user2)) |
-            ((Message.sender_id == user2) & (Message.receiver_id == user1))
+            or_(
+                and_(Message.sender_id == user1, Message.receiver_id == user2, Message.deleted_by_sender == False),
+                and_(Message.sender_id == user2, Message.receiver_id == user1, Message.deleted_by_receiver == False)
+            )
         )
         .order_by(Message.created_at)
     )
     return [dict(r._mapping) for r in result.all()]
 
 async def mark_messages_as_seen(db: AsyncSession, sender_id: int, receiver_id: int):
-    # Marks messages sent by 'sender_id' and received by 'receiver_id' as seen
     await db.execute(
         update(Message)
         .where(
             and_(
-                Message.sender_id == sender_id, 
-                Message.receiver_id == receiver_id, 
-                Message.status != "seen"
+                Message.sender_id == sender_id, Message.receiver_id == receiver_id, Message.status != "seen"
             )
         )
         .values(status="seen")
@@ -226,17 +179,11 @@ async def mark_messages_as_seen(db: AsyncSession, sender_id: int, receiver_id: i
 
 async def update_user_presence(db: AsyncSession, user_id: int, is_online: bool):
     await db.execute(
-        update(User)
-        .where(User.id == user_id)
-        .values(is_online=is_online, last_seen=func.now())
+        update(User).where(User.id == user_id).values(is_online=is_online, last_seen=func.now())
     )
     await db.commit()
-# =====================
-# WALLET HELPERS
-# =====================
 
 async def credit_coins(db: AsyncSession, user_id: int, amount: int, description: str):
-    """Helper to add coins and log the transaction."""
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalars().first()
     if user:
@@ -246,35 +193,13 @@ async def credit_coins(db: AsyncSession, user_id: int, amount: int, description:
         return True
     return False
 
-
-# =====================
-# SUPPORT TICKETS
-# =====================
-
-async def create_support_ticket(
-    db: AsyncSession,
-    email: str,
-    subject: str,
-    category: str,
-    urgency: str,
-    issue: str,
-) -> SupportTicket:
-    """
-    Persists a new support ticket.
-    Automatically checks whether the submitted email belongs to a
-    registered (= verified) user and sets email_verified accordingly.
-    """
-    # Check if the email is linked to a registered user
+async def create_support_ticket(db: AsyncSession, email: str, subject: str, category: str, urgency: str, issue: str) -> SupportTicket:
     user_result = await db.execute(select(User).where(User.email == email.lower().strip()))
     email_verified = user_result.scalars().first() is not None
 
     ticket = SupportTicket(
-        email=email.lower().strip(),
-        subject=subject,
-        category=category,
-        urgency=urgency,
-        issue=issue,
-        email_verified=email_verified,
+        email=email.lower().strip(), subject=subject, category=category,
+        urgency=urgency, issue=issue, email_verified=email_verified,
     )
     db.add(ticket)
     await db.commit()

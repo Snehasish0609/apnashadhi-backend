@@ -11,13 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text, select, or_, and_
+from sqlalchemy import text, select, or_, and_, update, func
 
 from db import engine, SessionLocal
 # Added Referral, Transaction, BlockedUser and Report from intern's code
 from models import Base, User, Message, Interaction, Referral, Transaction, BlockedUser, Report , OTPCode
 # Added intern's wallet schemas
-from schemas import RegisterUser, LoginUser, UserResponse, MessageCreate, UpdateUser, InteractionCreate, MatchmakerQuizParams, TransactionOut, ReferralHistoryItem, WalletInfo, ProfileVisibilityUpdate, OTPRequest, OTPVerify,SupportTicketCreate,SupportTicketOut
+from schemas import RegisterUser, LoginUser, UserResponse, MessageCreate, UpdateUser, InteractionCreate, MatchmakerQuizParams, TransactionOut, ReferralHistoryItem, WalletInfo, ProfileVisibilityUpdate, OTPRequest, OTPVerify,SupportTicketCreate,SupportTicketOut,ForgotPasswordRequest,ResetPasswordConfirm
 from crud import (
     create_user,
     authenticate_user,
@@ -28,7 +28,8 @@ from crud import (
     get_user_by_mobile,
     create_support_ticket,
     update_user_presence,
-    mark_messages_as_seen
+    mark_messages_as_seen,
+    PG_SECRET
 )
 from auth import create_access_token, get_current_user, verify_password, hash_password
 
@@ -718,6 +719,29 @@ async def handle_interaction(
         if check_mutual.scalars().first():
             is_mutual = True
 
+    # 🔥 NEW: Send Real-Time WebSockets Notification to the target user
+    if data.action == 'interest':
+        # Get the sender's name so the notification is friendly
+        sender_res = await db.execute(select(User).where(User.id == user_id))
+        sender = sender_res.scalars().first()
+        sender_name = sender.first_name if sender else "Someone"
+
+        if is_mutual:
+            notif_payload = {
+                "type": "system_notification",
+                "title": "It's a Match! 🎉",
+                "body": f"You and {sender_name} liked each other!"
+            }
+        else:
+            notif_payload = {
+                "type": "system_notification",
+                "title": "New Request! 💖",
+                "body": f"{sender_name} sent you an interest."
+            }
+        
+        # Fire it off through the WebSocket manager
+        await manager.send_personal_message(notif_payload, data.target_id)
+
     return {"message": f"Successfully marked as {data.action}", "is_mutual_match": is_mutual}
 
 # =====================
@@ -804,6 +828,10 @@ async def get_mutual_matches(
     i_rejected_res = await db.execute(select(Interaction.target_id).where(Interaction.user_id == user_id, Interaction.action == 'reject'))
     i_rejected_ids = set(i_rejected_res.scalars().all())
 
+    # 🔥 UPDATED: Fetch block list to mask online status/hide if blocked
+    blocks_res = await db.execute(select(BlockedUser).where(or_(BlockedUser.user_id == user_id, BlockedUser.blocked_user_id == user_id)))
+    blocked_ids = {b.blocked_user_id if b.user_id == user_id else b.user_id for b in blocks_res.scalars().all()}
+
     # Fetch ALL other users to check for 90% auto-matches
     all_other_res = await db.execute(select(User).where(User.id != user_id))
     all_other_users = all_other_res.scalars().all()
@@ -824,13 +852,52 @@ async def get_mutual_matches(
             user_data.pop("password", None)
             user_data["match_percentage"] = match_pct
             user_data["match_reason"] = "Mutual Interest" if is_mutual else "Auto Matched (90%+)"
+            
+            # 🔥 Hide presence if blocked
+            if u.id in blocked_ids:
+                user_data["is_blocked"] = True
+                user_data["is_online"] = False
+                user_data["last_seen"] = None
+            else:
+                user_data["is_blocked"] = False
+                
             safe_users.append(user_data)
             
     # Sort highest percentage first
     safe_users.sort(key=lambda x: x.get("match_percentage", 0), reverse=True)
     return safe_users
 
+# =====================
+# UNREAD MESSAGES
+# =====================
+@app.get("/chat/unread")
+async def get_unread_messages(
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user),
+):
+    """
+    Must be placed ABOVE /chat/{other_user_id} so FastAPI doesn't 
+    confuse 'unread' for an integer ID.
+    """
+    # Count unread messages grouped by sender
+    result = await db.execute(
+        select(Message.sender_id, func.count(Message.id).label("unread_count"))
+        .where(
+            Message.receiver_id == user_id,
+            Message.status != "seen",
+            Message.is_deleted == False
+        )
+        .group_by(Message.sender_id)
+    )
+    
+    # Format the data
+    unread_data = [{"sender_id": row.sender_id, "count": row.unread_count} for row in result.all()]
+    total_unread = sum(item["count"] for item in unread_data)
 
+    return {
+        "total_unread": total_unread, 
+        "details": unread_data
+    }
 # =====================
 # CHAT
 # =====================
@@ -852,14 +919,20 @@ from datetime import datetime
 @app.post("/chat/upload")
 async def upload_media(file: UploadFile = File(...)):
     # Basic local storage (Update path as needed or switch to S3)
-    os.makedirs("static/uploads", exist_ok=True)
-    file_path = f"static/uploads/{int(datetime.now().timestamp())}_{file.filename}"
+    os.makedirs("uploads", exist_ok=True) 
+    file_path = f"uploads/{int(datetime.now().timestamp())}_{file.filename}" 
     
     async with aiofiles.open(file_path, 'wb') as out_file:
         content = await file.read()
         await out_file.write(content)
         
-    media_type = "video" if file.content_type.startswith("video/") else "image"
+    if file.content_type.startswith("audio/"):
+        media_type = "audio"
+    elif file.content_type.startswith("video/"):
+        media_type = "video"
+    else:
+        media_type = "image"
+        
     return {"url": f"/{file_path}", "type": media_type}
 
 @app.post("/chat/send")
@@ -868,12 +941,20 @@ async def send_message(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user),
 ):
-    # (Keep your block check logic here...)
+    # 🔥 UPDATED: Block Sending Check added!
+    blocked_check = await db.execute(
+        select(BlockedUser).where(
+            or_(
+                and_(BlockedUser.user_id == user_id, BlockedUser.blocked_user_id == data.receiver_id),
+                and_(BlockedUser.user_id == data.receiver_id, BlockedUser.blocked_user_id == user_id)
+            )
+        )
+    )
+    if blocked_check.scalars().first():
+        raise HTTPException(status_code=403, detail="Cannot send message. User is blocked.")
+
     return await save_message(db, user_id, data.receiver_id, data.message, data.media_url, data.media_type)
 
-# =====================
-# WEBSOCKET MANAGER
-# =====================
 # =====================
 # WEBSOCKET MANAGER
 # =====================
@@ -1108,6 +1189,14 @@ async def get_public_profile(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user)
 ):
+    # 🔥 UPDATED: Block Profile Viewing Check
+    blocked_check = await db.execute(select(BlockedUser).where(or_(
+        and_(BlockedUser.user_id == user_id, BlockedUser.blocked_user_id == target_id),
+        and_(BlockedUser.user_id == target_id, BlockedUser.blocked_user_id == user_id)
+    )))
+    if blocked_check.scalars().first(): 
+        raise HTTPException(status_code=403, detail="Profile unavailable")
+
     result = await db.execute(select(User).where(User.id == target_id))
     user = result.scalars().first()
     
@@ -1499,7 +1588,7 @@ async def send_otp(
     # Generate new OTP
     otp = _generate_otp()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
-
+    print(f"\n[DEBUG] Generated OTP for {email}: {otp}\n")
     new_otp = OTPCode(
         email=email,
         otp_code=otp,
@@ -1627,3 +1716,156 @@ async def submit_support_ticket(
         issue=data.issue,
     )
     return ticket
+
+
+@app.delete("/chat/message/{message_id}")
+async def delete_chat_message(
+    message_id: int, 
+    type: str, # 'me' or 'everyone'
+    db: AsyncSession = Depends(get_db), 
+    user_id: int = Depends(get_current_user)
+):
+    # Fetch the message
+    result = await db.execute(select(Message).where(Message.id == message_id))
+    msg = result.scalars().first()
+
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    # 🔥 UPDATED: Soft Deleting Instead of Hard Deleting
+    if type == "everyone":
+        if msg.sender_id != user_id:
+            raise HTTPException(status_code=403, detail="You can only delete your own messages for everyone")
+        
+        # Soft delete: update the message text and remove media
+        msg.is_deleted = True
+        msg.message = func.pgp_sym_encrypt("🚫 This message was deleted", PG_SECRET)
+        msg.media_url = None
+        
+        await db.commit()
+        return {"status": "deleted for everyone"}
+        
+    elif type == "me":
+        # Mark as deleted only for the person requesting it
+        if msg.sender_id == user_id:
+            msg.deleted_by_sender = True
+        elif msg.receiver_id == user_id:
+            msg.deleted_by_receiver = True
+        else:
+            raise HTTPException(status_code=403, detail="Not authorized to delete this message")
+            
+        await db.commit()
+        return {"status": "deleted for me"}
+
+    raise HTTPException(status_code=400, detail="Invalid delete type")
+
+
+@app.post("/auth/forgot-password/send-otp")
+async def forgot_password_send_otp(
+    data: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Checks if user exists, then sends a password reset OTP."""
+    email = data.email.lower().strip()
+
+    # 1. Verify the user actually exists before sending an OTP
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalars().first()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="No account found with this email.")
+
+    # 2. Invalidate previous unused OTPs for this email
+    prev_result = await db.execute(
+        select(OTPCode).where(OTPCode.email == email, OTPCode.is_used == False)
+    )
+    for old_otp in prev_result.scalars().all():
+        old_otp.is_used = True
+
+    # 3. Generate new OTP and save to DB
+    otp = _generate_otp()
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    
+    # 🔥 ADDED: Print OTP to the terminal immediately for easy testing
+    print(f"\n[DEBUG] Forgot Password OTP for {email}: {otp}\n")
+    
+    new_otp = OTPCode(
+        email=email,
+        otp_code=otp,
+        expires_at=expires_at,
+        is_used=False,
+    )
+    db.add(new_otp)
+    await db.commit()
+
+    # 4. Send the Email (Reusing your existing SMTP logic)
+    smtp_ok = _smtp_is_configured()
+    email_sent = False
+
+    if smtp_ok:
+        try:
+            await _send_otp_email(email, otp)
+            email_sent = True
+        except Exception as exc:
+            print(f"[forgot-pwd] WARNING: SMTP send failed: {exc}")
+
+    if not email_sent:
+        # DEV MODE fallback print
+        print("\n" + "=" * 56)
+        print(f"  [FORGOT PASSWORD] OTP for {email}")
+        print(f"  [CODE]  {otp}")
+        print("=" * 56 + "\n")
+        return {
+            "message": "[DEV MODE] OTP printed to server console.", 
+            "dev_mode": True
+        }
+
+    return {"message": "Password reset OTP sent to your email.", "dev_mode": False}
+
+
+@app.post("/auth/forgot-password/reset")
+async def reset_password(
+    data: ResetPasswordConfirm,
+    db: AsyncSession = Depends(get_db),
+):
+    """Verifies the OTP and updates the user's password."""
+    email = data.email.lower().strip()
+    now = datetime.now(timezone.utc)
+
+    # 1. Fetch the latest unused OTP
+    result = await db.execute(
+        select(OTPCode)
+        .where(OTPCode.email == email, OTPCode.is_used == False)
+        .order_by(OTPCode.created_at.desc())
+        .limit(1)
+    )
+    otp_record = result.scalars().first()
+
+    # 2. Validate OTP existence, expiry, and match
+    if not otp_record:
+        raise HTTPException(status_code=400, detail="No valid OTP found. Please request a new one.")
+
+    if otp_record.expires_at.replace(tzinfo=timezone.utc) < now:
+        otp_record.is_used = True
+        await db.commit()
+        raise HTTPException(status_code=410, detail="OTP has expired. Please request a new one.")
+
+    if otp_record.otp_code != data.otp.strip():
+        raise HTTPException(status_code=400, detail="Incorrect OTP. Please try again.")
+
+    # 3. OTP is valid -> Mark it as used
+    otp_record.is_used = True
+
+    # 4. Fetch User and update password
+    user_res = await db.execute(select(User).where(User.email == email))
+    user = user_res.scalars().first()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    # Reusing your existing hash_password function from auth.py
+    user.password = hash_password(data.new_password)
+    
+    await db.commit()
+
+    return {"message": "Password reset successfully. You can now log in."}
