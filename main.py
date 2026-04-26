@@ -1233,11 +1233,48 @@ async def get_public_profile(
     user_data.pop("password", None)
     
     return user_data
-
-
 # =====================
 # FREE "AI" QUIZ SEARCH 🔥 (Intern Updated)
 # =====================
+CITIES_BY_STATE = {
+    "Andaman & Nicobar Islands": ["Port Blair", "Diglipur", "Mayabunder"],
+    "Andhra Pradesh": ["Vijayawada", "Visakhapatnam", "Tirupati", "Guntur", "Nellore", "Kurnool", "Rajahmundry", "Kadapa", "Kakinada", "Eluru", "Ongole", "Anantapur", "Chittoor", "Vizianagaram", "Bhimavaram"],
+    "Arunachal Pradesh": ["Itanagar", "Naharlagun", "Pasighat", "Tawang", "Ziro"],
+    "Assam": ["Guwahati", "Silchar", "Dibrugarh", "Jorhat", "Nagaon", "Tezpur", "Tinsukia", "Bongaigaon", "Dhubri", "Karimganj"],
+    "Bihar": ["Patna", "Gaya", "Bhagalpur", "Muzaffarpur", "Bihar Sharif", "Purnia", "Darbhanga", "Arrah", "Begusarai", "Katihar", "Munger", "Hajipur", "Sasaram"],
+    "Chandigarh": ["Chandigarh"],
+    "Chhattisgarh": ["Raipur", "Bhilai", "Bilaspur", "Korba", "Durg", "Rajnandgaon", "Jagdalpur", "Ambikapur"],
+    "Dadra & Nagar Haveli and Daman & Diu": ["Daman", "Diu", "Silvassa"],
+    "Delhi (NCT)": ["New Delhi", "Delhi NCR", "Dwarka", "Rohini", "Janakpuri", "Vasant Kunj", "Saket"],
+    "Goa": ["Panaji", "Margao", "Vasco da Gama", "Mapusa", "Ponda"],
+    "Gujarat": ["Ahmedabad", "Surat", "Vadodara", "Rajkot", "Bhavnagar", "Jamnagar", "Gandhinagar", "Junagadh", "Anand", "Vapi", "Ankleshwar", "Surendranagar", "Bhuj", "Bharuch", "Navsari"],
+    "Haryana": ["Faridabad", "Gurgaon", "Panipat", "Ambala", "Hisar", "Rohtak", "Karnal", "Yamunanagar", "Sonipat", "Bhiwani", "Panchkula", "Sirsa"],
+    "Himachal Pradesh": ["Shimla", "Dharamshala", "Solan", "Mandi", "Palampur", "Baddi", "Nahan", "Hamirpur", "Manali", "Kullu"],
+    "Jammu & Kashmir": ["Jammu", "Srinagar", "Anantnag", "Baramulla"],
+    "Jharkhand": ["Ranchi", "Jamshedpur", "Dhanbad", "Bokaro", "Deoghar", "Hazaribagh", "Giridih", "Ramgarh"],
+    "Karnataka": ["Bangalore", "Mysore", "Hubli", "Mangalore", "Belagavi", "Kalaburagi", "Davangere", "Ballari", "Tumkur", "Udupi", "Shimoga", "Bagalkot", "Bidar", "Kolar", "Hassan"],
+    "Kerala": ["Kochi", "Thiruvananthapuram", "Kozhikode", "Thrissur", "Kollam", "Palakkad", "Alappuzha", "Kannur", "Kottayam", "Malappuram", "Thalassery"],
+    "Ladakh": ["Leh", "Kargil"],
+    "Lakshadweep": ["Kavaratti"],
+    "Madhya Pradesh": ["Bhopal", "Indore", "Jabalpur", "Gwalior", "Ujjain", "Sagar", "Rewa", "Satna", "Dewas", "Chhindwara", "Khandwa", "Burhanpur"],
+    "Maharashtra": ["Mumbai", "Pune", "Nagpur", "Nashik", "Thane", "Aurangabad", "Solapur", "Kolhapur", "Navi Mumbai", "Palghar", "Amravati", "Latur", "Nanded", "Sangli", "Satara", "Jalgaon", "Akola", "Baramati", "Kalyan-Dombivli", "Vasai-Virar"],
+    "Manipur": ["Imphal", "Thoubal", "Bishnupur", "Churachandpur"],
+    "Meghalaya": ["Shillong", "Tura", "Jowai", "Nongstoin"],
+    "Mizoram": ["Aizawl", "Lunglei", "Saiha", "Champhai"],
+    "Nagaland": ["Kohima", "Dimapur", "Mokokchung", "Tuensang"],
+    "Odisha": ["Bhubaneswar", "Cuttack", "Rourkela", "Puri", "Berhampur", "Sambalpur", "Khordha", "Balasore", "Bhadrak", "Baripada"],
+    "Puducherry": ["Pondicherry", "Auroville", "Karaikal", "Mahe", "Yanam"],
+    "Punjab": ["Ludhiana", "Amritsar", "Jalandhar", "Patiala", "Bathinda", "Mohali", "Pathankot", "Faridkot", "Firozpur", "Moga", "Hoshiarpur"],
+    "Rajasthan": ["Jaipur", "Jodhpur", "Udaipur", "Kota", "Bikaner", "Ajmer", "Alwar", "Bharatpur", "Sikar", "Bhilwara", "Pali", "Sri Ganganagar"],
+    "Sikkim": ["Gangtok", "Namchi", "Geyzing", "Mangan"],
+    "Tamil Nadu": ["Chennai", "Coimbatore", "Madurai", "Tiruchirappalli", "Salem", "Tirunelveli", "Tiruppur", "Vellore", "Erode", "Thoothukudi", "Dindigul", "Thanjavur", "Kanchipuram", "Ooty"],
+    "Telangana": ["Hyderabad", "Warangal", "Nizamabad", "Karimnagar", "Khammam", "Ramagundam", "Mahbubnagar", "Nalgonda", "Adilabad"],
+    "Tripura": ["Agartala", "Udaipur", "Dharmanagar", "Kailasahar"],
+    "Uttar Pradesh": ["Lucknow", "Kanpur", "Agra", "Varanasi", "Meerut", "Allahabad (Prayagraj)", "Ghaziabad", "Bareilly", "Aligarh", "Moradabad", "Noida", "Greater Noida", "Mathura", "Bulandshahr", "Gorakhpur", "Jhansi", "Firozabad", "Farrukhabad", "Mirzapur", "Hathras", "Hapur", "Saharanpur"],
+    "Uttarakhand": ["Dehradun", "Haridwar", "Roorkee", "Haldwani", "Kashipur", "Rudrapur", "Nainital", "Rishikesh"],
+    "West Bengal": ["Kolkata", "Howrah", "Durgapur", "Siliguri", "Asansol", "Kharagpur", "Kalyani", "Darjeeling", "Bankura", "Krishnanagar", "Konnagar", "Bardhaman", "Malda", "Baharampur", "Serampore", "Haldia", "Jalpaiguri", "Hooghly", "Midnapore", "Barasat", "Dum Dum"]
+}
+
 @app.post("/ai-matchmaker/quiz-search")
 async def ai_quiz_search(
     data: MatchmakerQuizParams,
@@ -1245,63 +1282,134 @@ async def ai_quiz_search(
     user_id: int = Depends(get_current_user)
 ):
     ans = data.answers
-    base = select(User).where(User.id != user_id)
+    
+    # 🌍 Location Handling
+    selected_state = ans.get("state")
+    selected_city = ans.get("city")
+    
+    # Normalize input for validation against mapping
+    state_key = next((k for k in CITIES_BY_STATE if k.lower() == (selected_state or "").lower()), None)
+    
+    if selected_state:
+        if not state_key:
+            # Validation 2: If state does not exist in mapping
+            return {"status": "empty", "message": "No profiles found"}
+            
+        if selected_city:
+            # Validation 2: If city is selected but not in the selected state's list
+            city_exists = any(c.lower() == selected_city.lower() for c in CITIES_BY_STATE[state_key])
+            if not city_exists:
+                return {"status": "empty", "message": "No profiles found"}
 
-    # ── Helper: build query applying only the chosen filter fields ────
-    def build_query(fields):
-        q = base
-        if "city" in fields and ans.get("city"):
-            q = q.where(User.city.ilike(f"%{ans['city']}%"))
-        if "religion" in fields and ans.get("religion"):
-            q = q.where(User.religion.ilike(f"%{ans['religion']}%"))
-        if "profession" in fields and ans.get("profession"):
-            q = q.where(User.profession.ilike(f"%{ans['profession']}%"))
-        if "caste" in fields and ans.get("caste"):
-            q = q.where(User.caste.ilike(f"%{ans['caste']}%"))
-        if "diet" in fields and ans.get("diet"):
-            q = q.where(User.diet.ilike(f"%{ans['diet']}%"))
-        if "marital_status" in fields and ans.get("marital_status"):
-            q = q.where(User.marital_status.ilike(f"%{ans['marital_status']}%"))
-        if "education" in fields and ans.get("education"):
-            q = q.where(User.education.ilike(f"%{ans['education']}%"))
-        if "mother_tongue" in fields and ans.get("mother_tongue"):
-            q = q.where(User.mother_tongue.ilike(f"%{ans['mother_tongue']}%"))
-        if "habits" in fields and ans.get("habits"):
-            q = q.where(User.habits.ilike(f"%{ans['habits']}%"))
-        if "family_type" in fields and ans.get("family_type"):
-            q = q.where(User.family_type.ilike(f"%{ans['family_type']}%"))
-        if "relationship_type" in fields and ans.get("relationship_type"):
-            q = q.where(User.relationship_type.ilike(f"%{ans['relationship_type']}%"))
-        return q
+    # 🎯 Base Query
+    query = select(User).where(User.id != user_id)
 
-    ALL_FIELDS  = ["city", "religion", "profession", "caste", "diet",
-                   "marital_status", "education", "mother_tongue", "habits",
-                   "family_type", "relationship_type"]
-    SOFT_FIELDS = ["city", "religion", "relationship_type"]
+    # 🎯 Location Filter (Rule 1)
+    if selected_state:
+        query = query.where(func.lower(User.state) == selected_state.lower())
+    if selected_city:
+        query = query.where(func.lower(User.city) == selected_city.lower())
 
-    # Pass 1 — strict: ALL selected filters AND together
-    result = await db.execute(build_query(ALL_FIELDS))
-    matches = result.scalars().all()
+    # 🎯 Religion (Preserving previous turn's strictness)
+    ALLOWED_RELIGIONS = [
+        "Hindu", "Muslim", "Christian", "Sikh", "Buddhist", "Jain",
+        "Zoroastrian (Parsi)", "Jewish", "Bahá'í", "Tribal / Indigenous Faith",
+        "No Religion / Atheist", "Spiritual but not Religious", "Other"
+    ]
+    allowed_rel_lower = [r.lower() for r in ALLOWED_RELIGIONS]
+    
+    # Profile data validation: religion must be in allowed list
+    query = query.where(func.lower(User.religion).in_(allowed_rel_lower))
+    
+    rel_pref = ans.get("religion")
+    if rel_pref and rel_pref.lower() not in ["any", "no preference", "any / no preference"]:
+        query = query.where(func.lower(User.religion) == rel_pref.lower())
 
-    # Pass 2 — relaxed: keep only city + religion
-    if not matches:
-        result = await db.execute(build_query(SOFT_FIELDS))
-        matches = result.scalars().all()
+    # 🎯 Preserve ALL other filters exactly (Rule 5)
+    if ans.get("gender"):
+        query = query.where(func.lower(User.gender) == ans["gender"].lower())
+    if ans.get("profession") and ans["profession"].lower() not in ["any", "no preference"]:
+        query = query.where(func.lower(User.profession) == ans["profession"].lower())
+    if ans.get("caste") and ans["caste"].lower() not in ["any", "any caste", "no preference"]:
+        query = query.where(func.lower(User.caste) == ans["caste"].lower())
+    if ans.get("diet") and ans["diet"].lower() not in ["any", "no preference"]:
+        query = query.where(func.lower(User.diet) == ans["diet"].lower())
+    if ans.get("marital_status") and ans["marital_status"].lower() not in ["any", "no preference"]:
+        query = query.where(func.lower(User.marital_status) == ans["marital_status"].lower())
+    if ans.get("education") and ans["education"].lower() not in ["any", "no preference"]:
+        query = query.where(func.lower(User.education) == ans["education"].lower())
+    if ans.get("mother_tongue") and ans["mother_tongue"].lower() not in ["any", "no preference"]:
+        query = query.where(func.lower(User.mother_tongue) == ans["mother_tongue"].lower())
+    if ans.get("relationship_type") and ans["relationship_type"].lower() not in ["any", "no preference"]:
+        query = query.where(func.lower(User.relationship_type) == ans["relationship_type"].lower())
 
-    # Pass 3 — broadest: no preference filters, just exclude self
-    if not matches:
-        result = await db.execute(base)
-        matches = result.scalars().all()
+    # 🎯 Age Range Filter
+    age_range = ans.get("age_range")
+    if age_range and age_range.lower() not in ["any", "no preference"]:
+        try:
+            parts = age_range.replace(" to ", "-").split("-")
+            if len(parts) == 2:
+                min_age = int(parts[0].strip())
+                max_age = int(parts[1].strip())
+                today = date.today()
+                
+                max_dob = date(today.year - min_age, today.month, today.day)
+                min_dob = date(today.year - max_age - 1, today.month, today.day)
+                
+                query = query.where(User.date_of_birth >= min_dob)
+                query = query.where(User.date_of_birth <= max_dob)
+        except:
+            pass # Ignore invalid age formats
 
-    safe_matches = []
-    for u in matches[:10]:
-        user_data = u.__dict__.copy()
-        user_data.pop("_sa_instance_state", None)
-        user_data.pop("password", None)
-        user_data["match_percentage"] = 95
-        safe_matches.append(user_data)
+    # 🎯 Execute Query
+    result = await db.execute(query)
+    all_potential = result.scalars().all()
+    
+    valid_matches = []
 
-    return {"suggested_profiles": safe_matches}
+    for u in all_potential:
+        # Rule 4: profile.state exists in CITIES_BY_STATE and profile.city exists under that state
+        u_state_key = next((k for k in CITIES_BY_STATE if k.lower() == (u.state or "").lower()), None)
+        if u_state_key:
+            city_valid = any(c.lower() == (u.city or "").lower() for c in CITIES_BY_STATE[u_state_key])
+            if city_valid:
+                
+                # 🚨 Rule 6: PROFILE PICTURE RULE
+                # Check if picture exists and isn't the default, but DO NOT modify the URL string
+                pic = u.profile_pic
+                if not pic or pic.strip() == "" or "default.png" in pic.lower():
+                    continue
+                
+                valid_matches.append(u)
+
+    # 🎯 No Match Case (Rule 7)
+    if not valid_matches:
+        return {"status": "empty", "message": "No profiles found"}
+
+    # 🎯 Shuffling for "Any City" logic or general randomization
+    if not selected_city or selected_city.lower() in ["any city", "any", "no preference"]:
+        random.shuffle(valid_matches)
+
+    # 📦 Expected Output Format
+    profiles_out = []
+    for u in valid_matches:
+        profiles_out.append({
+            "id": str(u.id),
+            "name": f"{u.first_name} {u.last_name}",
+            "state": u.state,
+            "city": u.city,
+            "religion": u.religion,
+            "profile_pic": u.profile_pic, # Passing raw path, frontend Axios will prepend baseURL
+            "first_name": u.first_name,
+            "profession": u.profession,
+            "date_of_birth": u.date_of_birth.isoformat() if u.date_of_birth else None
+        })
+
+    return {
+        "status": "success",
+        "count": len(profiles_out),
+        "profiles": profiles_out
+    }
 
 # =====================================================================
 # REFERRAL & WALLET SYSTEM (Intern Added)
@@ -1869,3 +1977,62 @@ async def reset_password(
     await db.commit()
 
     return {"message": "Password reset successfully. You can now log in."}
+
+
+# =====================
+# SEARCH USERS BY NAME / ID
+# =====================
+@app.get("/users/search")
+async def search_users_by_name(
+    q: str,
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user)
+):
+    if not q or len(q.strip()) < 2:
+        return []
+
+    # Get blocked IDs so we don't show them in search results
+    blocked_check = await db.execute(
+        select(BlockedUser).where(
+            or_(
+                BlockedUser.user_id == user_id,
+                BlockedUser.blocked_user_id == user_id
+            )
+        )
+    )
+    blocked_ids = {b.blocked_user_id if b.user_id == user_id else b.user_id for b in blocked_check.scalars().all()}
+
+    search_term = f"%{q.strip()}%"
+
+    # Search by concatenated first/last name or profile ID
+    query = select(User).where(
+        and_(
+            User.id != user_id,
+            or_(
+                func.concat(User.first_name, ' ', User.last_name).ilike(search_term),
+                User.first_name.ilike(search_term),
+                User.last_name.ilike(search_term),
+                User.profile_id.ilike(search_term)
+            )
+        )
+    ).limit(10) # Limit to 10 results for quick UI response
+
+    result = await db.execute(query)
+    users = result.scalars().all()
+
+    safe_users = []
+    for u in users:
+        if u.id in blocked_ids:
+            continue
+            
+        # Profile Visibility Check
+        visibility = u.profile_visibility or "public"
+        if visibility == "premium_only":
+            continue # Hide premium-only profiles from global free search
+
+        user_data = u.__dict__.copy()
+        user_data.pop("_sa_instance_state", None)
+        user_data.pop("password", None)
+        safe_users.append(user_data)
+
+    return safe_users
