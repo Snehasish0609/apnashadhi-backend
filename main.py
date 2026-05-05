@@ -178,7 +178,7 @@ async def get_my_profile(
 
 
 # =====================
-# PROFILE UPDATE 🔥
+# PROFILE UPDATE 🔥 (FIXED REFERRAL LOGIC)
 # =====================
 @app.put("/profile/update")
 async def update_profile(
@@ -218,7 +218,11 @@ async def update_profile(
         )
         ref_row = ref_result.scalars().first()
         if ref_row:
-            coins = 10
+            # 1. Immediately flag as True and flush to prevent duplicate processing
+            ref_row.reward_given = True
+            await db.flush()
+            
+            # 2. Check milestone count (This count now properly INCLUDES the current referral)
             done_count_res = await db.execute(
                 select(Referral).where(
                     Referral.referrer_id == ref_row.referrer_id,
@@ -226,12 +230,16 @@ async def update_profile(
                 )
             )
             done_count = len(done_count_res.scalars().all())
-            if done_count + 1 == 5:
+            
+            # 3. Calculate coins based on milestones
+            coins = 10
+            if done_count == 5:
                 coins += 20
-            elif done_count + 1 == 10:
+            elif done_count == 10:
                 coins += 50
+                
+            # 4. Atomically credit coins to the referrer
             await _credit_coins(db, ref_row.referrer_id, coins, f"Referral reward: {coins} Apna Coins")
-            ref_row.reward_given = True
             await db.commit()
 
     return {"message": "Profile updated successfully", "profile_completed": user.profile_completed}
@@ -459,9 +467,6 @@ async def report_user(
     db.add(report)
     await db.commit()
     return {"message": "Report submitted successfully"}
-
-
-
 
 
 # =====================
@@ -1233,6 +1238,7 @@ async def get_public_profile(
     user_data.pop("password", None)
     
     return user_data
+
 # =====================
 # FREE "AI" QUIZ SEARCH 🔥 (Intern Updated)
 # =====================
@@ -1412,16 +1418,19 @@ async def ai_quiz_search(
     }
 
 # =====================================================================
-# REFERRAL & WALLET SYSTEM (Intern Added)
+# REFERRAL & WALLET SYSTEM 🔥 (ATOMIC UPDATES APPLIED)
 # =====================================================================
 
 async def _credit_coins(db, user_id: int, amount: int, description: str):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalars().first()
-    if user:
-        user.coin_balance = (user.coin_balance or 0) + amount
-        txn = Transaction(user_id=user_id, amount=amount, description=description)
-        db.add(txn)
+    # Atomic SQL Update ensures no double-counting during concurrent requests
+    await db.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(coin_balance=func.coalesce(User.coin_balance, 0) + amount)
+    )
+    # Log the transaction
+    txn = Transaction(user_id=user_id, amount=amount, description=description)
+    db.add(txn)
 
 
 @app.get("/referral/validate/{code}")
@@ -1452,7 +1461,6 @@ async def get_referral_history(db: AsyncSession = Depends(get_db), user_id: int 
     refs_result = await db.execute(select(Referral).where(Referral.referrer_id == user_id))
     refs = refs_result.scalars().all()
 
-    needs_commit = False
     history = []
 
     for ref in refs:
@@ -1462,30 +1470,8 @@ async def get_referral_history(db: AsyncSession = Depends(get_db), user_id: int 
 
         profile_pct = ru.profile_completed or 0
         profile_complete = profile_pct >= 100
-
-        # ── Auto-grant reward if profile is 100% but reward not yet given ──
-        if profile_complete and not ref.reward_given:
-            # Calculate coins (base 10 + milestone bonuses)
-            coins = 10
-            done_count_res = await db.execute(
-                select(Referral).where(
-                    Referral.referrer_id == user_id,
-                    Referral.reward_given == True,
-                )
-            )
-            done_count = len(done_count_res.scalars().all())
-
-            # Milestone bonuses
-            if done_count + 1 == 5:
-                coins += 20   # 5th referral bonus
-            elif done_count + 1 == 10:
-                coins += 50   # 10th referral bonus
-
-            await _credit_coins(db, user_id, coins, f"Referral reward for {ru.first_name}: {coins} Apna Coins")
-            ref.reward_given = True
-            needs_commit = True
-
         status = "Completed" if profile_complete else "Pending"
+
         history.append({
             "referred_name": f"{ru.first_name} {ru.last_name}",
             "status": status,
@@ -1493,12 +1479,9 @@ async def get_referral_history(db: AsyncSession = Depends(get_db), user_id: int 
             "profile_completion": profile_pct,
         })
 
-    # Commit any auto-granted rewards
-    if needs_commit:
-        await db.commit()
-
     total_completed = sum(1 for h in history if h["status"] == "Completed")
     total_earned = sum(h["coins_earned"] for h in history)
+    
     return {
         "history": history,
         "total_referrals": len(history),
@@ -1507,31 +1490,40 @@ async def get_referral_history(db: AsyncSession = Depends(get_db), user_id: int 
     }
 
 
-
 @app.post("/referral/check-reward")
 async def check_and_grant_referral_reward(db: AsyncSession = Depends(get_db), user_id: int = Depends(get_current_user)):
     user_result = await db.execute(select(User).where(User.id == user_id))
     user = user_result.scalars().first()
+    
     if not user or (user.profile_completed or 0) < 100:
         return {"rewarded": False, "message": "Profile not yet 100%"}
+        
     ref_result = await db.execute(
         select(Referral).where(Referral.referred_id == user_id, Referral.reward_given == False)
     )
     ref_row = ref_result.scalars().first()
+    
     if not ref_row:
         return {"rewarded": False, "message": "No pending referral reward"}
+        
+    # Prevent concurrent triggers by immediately marking as true and flushing
+    ref_row.reward_given = True
+    await db.flush()
+    
     coins = 10
     done_count_res = await db.execute(
         select(Referral).where(Referral.referrer_id == ref_row.referrer_id, Referral.reward_given == True)
     )
     done_count = len(done_count_res.scalars().all())
-    if done_count + 1 == 5:
+    
+    if done_count == 5:
         coins += 20
-    elif done_count + 1 == 10:
+    elif done_count == 10:
         coins += 50
+        
     await _credit_coins(db, ref_row.referrer_id, coins, f"Referral reward: {coins} Apna Coins")
-    ref_row.reward_given = True
     await db.commit()
+    
     return {"rewarded": True, "coins_awarded": coins}
 
 
