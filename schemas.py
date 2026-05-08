@@ -246,3 +246,48 @@ class ResetPasswordConfirm(BaseModel):
     email: EmailStr
     otp: str = Field(min_length=6, max_length=6)
     new_password: str = Field(min_length=6) # Matches your registration min_length
+
+# =====================================================================
+# ACCOUNT DEACTIVATION & DELETION SCHEMAS
+# =====================================================================
+
+class DeactivateAccountRequest(BaseModel):
+    """Request to deactivate account (no password needed for deactivation)"""
+    reason: str | None = None  # Optional reason for deactivation
+
+class DeleteAccountRequest(BaseModel):
+    """Request to permanently delete account (password required for verification)"""
+    password: str = Field(min_length=1)  # Password for verification
+    reason: str | None = None  # Optional reason for deletion
+
+class DeactivatedAccountOut(BaseModel):
+    id: int
+    user_id: int
+    email: str
+    first_name: str
+    last_name: str
+    deactivation_date: datetime
+    reactivation_deadline: datetime
+    reason: str | None
+    
+    class Config:
+        from_attributes = True
+
+class DeletedAccountOut(BaseModel):
+    id: int
+    user_id: int
+    email: str
+    first_name: str
+    last_name: str
+    deletion_date: datetime
+    reason: str | None
+    
+    class Config:
+        from_attributes = True
+
+class ReactivateAccountResponse(BaseModel):
+    """Response when account is reactivated"""
+    message: str
+    user_id: int
+    email: str
+    status: str  # "reactivated"

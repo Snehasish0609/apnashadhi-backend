@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, Date, Boolean, UniqueConstraint ,LargeBinary
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, Date, Boolean, UniqueConstraint, LargeBinary
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from db import Base
@@ -9,8 +9,11 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     first_name = Column(String, nullable=False)
     last_name = Column(String, nullable=False)
-    email = Column(String, unique=True, index=True, nullable=False)
-    mobile_no = Column(String, unique=True, index=True, nullable=False)
+    
+    # 🔥 PGCrypto Encrypted Fields (Replaces plain text email and mobile_no)
+    email_encrypted = Column(LargeBinary, nullable=False)
+    mobile_encrypted = Column(LargeBinary, nullable=False)
+
     password = Column(String, nullable=False)
     date_of_birth = Column(Date, nullable=False)
     city = Column(String, nullable=False)
@@ -69,6 +72,31 @@ class User(Base):
     coin_balance = Column(Integer, default=0)
     is_online = Column(Boolean, default=False, server_default="false")
     last_seen = Column(DateTime(timezone=True), nullable=True)
+
+    # ==========================================
+    # ACCOUNT DEACTIVATION / DELETION FIELDS
+    # ==========================================
+    is_deactivated = Column(Boolean, default=False, nullable=False, server_default="false")  
+    deactivation_date = Column(DateTime(timezone=True), nullable=True)  
+    reactivation_deadline = Column(DateTime(timezone=True), nullable=True)  
+
+    # 🛠️ Transient Properties (Allows Pydantic to read/write the decrypted data in memory seamlessly)
+    @property
+    def email(self):
+        return getattr(self, '_email', None)
+
+    @email.setter
+    def email(self, value):
+        self._email = value
+
+    @property
+    def mobile_no(self):
+        return getattr(self, '_mobile_no', None)
+
+    @mobile_no.setter
+    def mobile_no(self, value):
+        self._mobile_no = value
+
 
 class Message(Base):
     __tablename__ = "messages"
@@ -140,11 +168,19 @@ class OTPCode(Base):
     """
     __tablename__ = "otp_codes"
     id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(255), nullable=False, index=True)
+    email_encrypted = Column(LargeBinary, nullable=False) # 🔥 PGCrypto
     otp_code = Column(String(6), nullable=False)  # plain 6-digit string
     expires_at = Column(DateTime(timezone=True), nullable=False)
     is_used = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    @property
+    def email(self):
+        return getattr(self, '_email', None)
+
+    @email.setter
+    def email(self, value):
+        self._email = value
 
 class SupportTicket(Base):
     """
@@ -154,10 +190,86 @@ class SupportTicket(Base):
     __tablename__ = "support_tickets"
 
     id             = Column(Integer, primary_key=True, index=True)
-    email          = Column(String(255), nullable=False, index=True)   # user-supplied email
+    email_encrypted= Column(LargeBinary, nullable=False) # 🔥 PGCrypto
     subject        = Column(String(500), nullable=False)
     category       = Column(String(100), nullable=False)               # e.g. "Account Help"
     urgency        = Column(String(50),  nullable=False, default="medium")  # low / medium / high
     issue          = Column(Text,        nullable=False)               # description text
     email_verified = Column(Boolean,     nullable=False, default=False) # True if email found in users table
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
+    
+    @property
+    def email(self):
+        return getattr(self, '_email', None)
+
+    @email.setter
+    def email(self, value):
+        self._email = value
+
+# ==========================================
+# ACCOUNT DEACTIVATION / DELETION TABLES
+# ==========================================
+
+class DeactivatedAccount(Base):
+    """
+    Tracks deactivated accounts. Users can reactivate within 30 days.
+    After 30 days, the account is permanently deleted.
+    """
+    __tablename__ = "deactivated_accounts"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True, unique=True)
+    email_encrypted = Column(LargeBinary, nullable=False) # 🔥 PGCrypto
+    first_name = Column(String, nullable=False)
+    last_name = Column(String, nullable=False)
+    deactivation_date = Column(DateTime(timezone=True), server_default=func.now())
+    reactivation_deadline = Column(DateTime(timezone=True), nullable=False)  # 30 days from deactivation
+    reason = Column(String, nullable=True)  # Optional: why they deactivated
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    @property
+    def email(self):
+        return getattr(self, '_email', None)
+
+    @email.setter
+    def email(self, value):
+        self._email = value
+
+class DeletedAccount(Base):
+    """
+    Archives deleted accounts. User data is preserved but account cannot login.
+    Kept for 1 year for recovery requests or regulatory purposes.
+    """
+    __tablename__ = "deleted_accounts"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True, unique=True)
+    
+    # 🔥 PGCrypto Encrypted Fields
+    email_encrypted = Column(LargeBinary, nullable=False)
+    mobile_encrypted = Column(LargeBinary, nullable=True)
+    
+    first_name = Column(String, nullable=False)
+    last_name = Column(String, nullable=False)
+    profile_pic = Column(String, nullable=True)
+    bio = Column(Text, nullable=True)
+    deletion_date = Column(DateTime(timezone=True), server_default=func.now())
+    reason = Column(String, nullable=True)  # Optional: why they deleted
+    archived_data = Column(Text, nullable=True)  # JSON backup of full user profile
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    @property
+    def email(self):
+        return getattr(self, '_email', None)
+
+    @email.setter
+    def email(self, value):
+        self._email = value
+
+    @property
+    def mobile_no(self):
+        return getattr(self, '_mobile_no', None)
+
+    @mobile_no.setter
+    def mobile_no(self, value):
+        self._mobile_no = value

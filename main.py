@@ -16,8 +16,13 @@ from sqlalchemy import text, select, or_, and_, update, func
 from db import engine, SessionLocal
 # Added Referral, Transaction, BlockedUser and Report from intern's code
 from models import Base, User, Message, Interaction, Referral, Transaction, BlockedUser, Report , OTPCode
-# Added intern's wallet schemas
-from schemas import RegisterUser, LoginUser, UserResponse, MessageCreate, UpdateUser, InteractionCreate, MatchmakerQuizParams, TransactionOut, ReferralHistoryItem, WalletInfo, ProfileVisibilityUpdate, OTPRequest, OTPVerify,SupportTicketCreate,SupportTicketOut,ForgotPasswordRequest,ResetPasswordConfirm
+# Added intern's wallet schemas & new deactivation schemas
+from schemas import (
+    RegisterUser, LoginUser, UserResponse, MessageCreate, UpdateUser, InteractionCreate, MatchmakerQuizParams, 
+    TransactionOut, ReferralHistoryItem, WalletInfo, ProfileVisibilityUpdate, OTPRequest, OTPVerify, 
+    SupportTicketCreate, SupportTicketOut, ForgotPasswordRequest, ResetPasswordConfirm,
+    DeactivateAccountRequest, DeleteAccountRequest
+)
 from crud import (
     create_user,
     authenticate_user,
@@ -29,11 +34,24 @@ from crud import (
     create_support_ticket,
     update_user_presence,
     mark_messages_as_seen,
+    deactivate_account,
+    delete_account_permanently,
+    get_user_by_id,          # 🔥 ADDED
+    sanitize_user_dict,      # 🔥 ADDED
     PG_SECRET
 )
 from auth import create_access_token, get_current_user, verify_password, hash_password
 
 app = FastAPI()
+
+# =====================
+# EMAIL UTILITY STUBS (Prevent NameError)
+# =====================
+def send_deactivation_email(email, first_name, reactivation_deadline):
+    print(f"[MAIL] Deactivation email sent to {email}. Deadline: {reactivation_deadline}")
+
+def send_deletion_email(email, first_name):
+    print(f"[MAIL] Permanent deletion email sent to {email}.")
 
 # =====================
 # STARTUP (ASYNC DB INIT)
@@ -163,8 +181,7 @@ async def get_my_profile(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user),
 ):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalars().first()
+    user = await get_user_by_id(db, user_id)
     
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -174,7 +191,7 @@ async def get_my_profile(
         user.profile_id = f"AS{str(user.id).zfill(5)}"
         await db.commit()
         
-    return user
+    return sanitize_user_dict(user)
 
 
 # =====================
@@ -186,8 +203,7 @@ async def update_profile(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user),
 ):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalars().first()
+    user = await get_user_by_id(db, user_id)
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -195,7 +211,13 @@ async def update_profile(
     # This loops through only the data sent and updates it
     for key, value in data.dict(exclude_unset=True).items():
         if value is not None:
-            setattr(user, key, value)
+            # 🔥 Encrypt PII updates immediately
+            if key == "email":
+                user.email_encrypted = func.pgp_sym_encrypt(value.lower().strip(), PG_SECRET)
+            elif key == "mobile_no":
+                user.mobile_encrypted = func.pgp_sym_encrypt(value.strip(), PG_SECRET)
+            else:
+                setattr(user, key, value)
 
     await db.commit()
     await db.refresh(user)
@@ -239,6 +261,7 @@ async def update_profile(
                 coins += 50
                 
             # 4. Atomically credit coins to the referrer
+            from crud import _credit_coins
             await _credit_coins(db, ref_row.referrer_id, coins, f"Referral reward: {coins} Apna Coins")
             await db.commit()
 
@@ -260,8 +283,7 @@ async def upload_profile_pic(
     with open(file_location, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalars().first()
+    user = await get_user_by_id(db, user_id)
 
     user.profile_pic = file_location
 
@@ -278,8 +300,7 @@ async def get_profile_visibility(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user),
 ):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalars().first()
+    user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return {"profile_visibility": user.profile_visibility or "public"}
@@ -291,8 +312,7 @@ async def update_profile_visibility(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user),
 ):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalars().first()
+    user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     user.profile_visibility = data.profile_visibility
@@ -308,8 +328,7 @@ async def get_account_info(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user),
 ):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalars().first()
+    user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     # Auto-generate profile_id if missing
@@ -320,7 +339,7 @@ async def get_account_info(
         "profile_id": user.profile_id,
         "plan_type": user.plan_type or "free",
         "plan_expiry": user.plan_expiry.isoformat() if user.plan_expiry else None,
-        "email": user.email,
+        "email": user.email, # Dynamically attached in get_user_by_id
         "mobile_no": user.mobile_no,
         "first_name": user.first_name,
         "last_name": user.last_name,
@@ -347,8 +366,7 @@ async def change_password(
     if len(new_password) < 8:
         raise HTTPException(status_code=422, detail="New password must be at least 8 characters")
 
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalars().first()
+    user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -363,7 +381,6 @@ async def change_password(
     # Hash & save new password with bcrypt — old password will no longer work
     user.password = hash_password(new_password)
     await db.commit()
-    await db.refresh(user)   # Ensure new hash is confirmed in DB session
     return {"message": "Password changed successfully. Please log in again with your new password."}
 
 
@@ -460,8 +477,8 @@ async def report_user(
     if user_id == target_id:
         raise HTTPException(status_code=400, detail="Cannot report yourself")
     # Check if target exists
-    tgt = await db.execute(select(User).where(User.id == target_id))
-    if not tgt.scalars().first():
+    tgt = await get_user_by_id(db, target_id)
+    if not tgt:
         raise HTTPException(status_code=404, detail="User not found")
     report = Report(reporter_id=user_id, reported_user_id=target_id, reason=reason)
     db.add(report)
@@ -472,10 +489,6 @@ async def report_user(
 # =====================
 # USERS
 # =====================
-async def get_all_users_route(db, user_id):
-    return await get_all_users(db, user_id)
-
-
 @app.get("/users")
 async def list_users(
     db: AsyncSession = Depends(get_db),
@@ -534,8 +547,7 @@ async def search_matches(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user)
 ):
-    current_user_res = await db.execute(select(User).where(User.id == user_id))
-    current_user = current_user_res.scalars().first()
+    current_user = await get_user_by_id(db, user_id)
 
     # Get interacted IDs to exclude
     interactions_res = await db.execute(
@@ -606,9 +618,8 @@ async def search_matches(
             continue
 
         match_pct = calculate_match_percentage(current_user, u)
-        user_data = u.__dict__.copy()
-        user_data.pop("_sa_instance_state", None)
-        user_data.pop("password", None)
+        
+        user_data = sanitize_user_dict(u)
         user_data["match_percentage"] = match_pct
         user_data["match_reason"] = "Search Result" if match_pct < 90 else "Top Match 🌟"
         results.append(user_data)
@@ -622,8 +633,7 @@ async def get_suggested_matches(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user)
 ):
-    current_user_res = await db.execute(select(User).where(User.id == user_id))
-    current_user = current_user_res.scalars().first()
+    current_user = await get_user_by_id(db, user_id)
 
     # Get mutual match IDs (both liked each other) — needed for "matches_only" filter
     i_liked_res = await db.execute(
@@ -667,9 +677,7 @@ async def get_suggested_matches(
         
         # Now we show ALL matches above 0% in the swipe feed!
         if match_pct > 0:
-            user_data = u.__dict__.copy()
-            user_data.pop("_sa_instance_state", None)
-            user_data.pop("password", None) 
+            user_data = sanitize_user_dict(u)
             user_data["match_percentage"] = match_pct
             
             # Send a reason to the frontend for the badge
@@ -727,8 +735,7 @@ async def handle_interaction(
     # 🔥 NEW: Send Real-Time WebSockets Notification to the target user
     if data.action == 'interest':
         # Get the sender's name so the notification is friendly
-        sender_res = await db.execute(select(User).where(User.id == user_id))
-        sender = sender_res.scalars().first()
+        sender = await get_user_by_id(db, user_id)
         sender_name = sender.first_name if sender else "Someone"
 
         if is_mutual:
@@ -800,10 +807,7 @@ async def get_rejected_profiles(
     # Strip passwords before sending to frontend
     safe_users = []
     for u in users_res.scalars().all():
-        user_data = u.__dict__.copy()
-        user_data.pop("_sa_instance_state", None)
-        user_data.pop("password", None)
-        safe_users.append(user_data)
+        safe_users.append(sanitize_user_dict(u))
         
     return safe_users
 
@@ -815,8 +819,7 @@ async def get_mutual_matches(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user)
 ):
-    current_user_res = await db.execute(select(User).where(User.id == user_id))
-    current_user = current_user_res.scalars().first()
+    current_user = await get_user_by_id(db, user_id)
 
     # 1. Who did I send an interest to?
     i_liked_res = await db.execute(select(Interaction.target_id).where(Interaction.user_id == user_id, Interaction.action == 'interest'))
@@ -852,9 +855,7 @@ async def get_mutual_matches(
 
         # If they liked each other, OR the AI determined they are a 90%+ perfect match
         if is_mutual or is_auto_match:
-            user_data = u.__dict__.copy()
-            user_data.pop("_sa_instance_state", None)
-            user_data.pop("password", None)
+            user_data = sanitize_user_dict(u)
             user_data["match_percentage"] = match_pct
             user_data["match_reason"] = "Mutual Interest" if is_mutual else "Auto Matched (90%+)"
             
@@ -1110,10 +1111,7 @@ async def get_pending_requests(
     
     safe_users = []
     for u in users_res.scalars().all():
-        user_data = u.__dict__.copy()
-        user_data.pop("_sa_instance_state", None)
-        user_data.pop("password", None)
-        safe_users.append(user_data)
+        safe_users.append(sanitize_user_dict(u))
         
     return safe_users
 
@@ -1143,10 +1141,7 @@ async def get_profile_visitors(
     
     safe_users = []
     for u in users_res.scalars().all():
-        user_data = u.__dict__.copy()
-        user_data.pop("_sa_instance_state", None)
-        user_data.pop("password", None)
-        safe_users.append(user_data)
+        safe_users.append(sanitize_user_dict(u))
         
     return safe_users
 
@@ -1202,8 +1197,7 @@ async def get_public_profile(
     if blocked_check.scalars().first(): 
         raise HTTPException(status_code=403, detail="Profile unavailable")
 
-    result = await db.execute(select(User).where(User.id == target_id))
-    user = result.scalars().first()
+    user = await get_user_by_id(db, target_id)
     
     if not user:
         raise HTTPException(status_code=404, detail="Profile not found")
@@ -1232,12 +1226,7 @@ async def get_public_profile(
         elif visibility == "premium_only":
             raise HTTPException(status_code=403, detail="This profile is only visible to premium members")
         
-    # Strip password before sending!
-    user_data = user.__dict__.copy()
-    user_data.pop("_sa_instance_state", None)
-    user_data.pop("password", None)
-    
-    return user_data
+    return sanitize_user_dict(user)
 
 # =====================
 # FREE "AI" QUIZ SEARCH 🔥 (Intern Updated)
@@ -1421,18 +1410,6 @@ async def ai_quiz_search(
 # REFERRAL & WALLET SYSTEM 🔥 (ATOMIC UPDATES APPLIED)
 # =====================================================================
 
-async def _credit_coins(db, user_id: int, amount: int, description: str):
-    # Atomic SQL Update ensures no double-counting during concurrent requests
-    await db.execute(
-        update(User)
-        .where(User.id == user_id)
-        .values(coin_balance=func.coalesce(User.coin_balance, 0) + amount)
-    )
-    # Log the transaction
-    txn = Transaction(user_id=user_id, amount=amount, description=description)
-    db.add(txn)
-
-
 @app.get("/referral/validate/{code}")
 async def validate_referral_code(code: str, db=Depends(get_db)):
     result = await db.execute(select(User).where(User.referral_code == code.upper()))
@@ -1444,8 +1421,7 @@ async def validate_referral_code(code: str, db=Depends(get_db)):
 
 @app.get("/referral/my-code")
 async def get_my_referral_code(db: AsyncSession = Depends(get_db), user_id: int = Depends(get_current_user)):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalars().first()
+    user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return {
@@ -1464,7 +1440,7 @@ async def get_referral_history(db: AsyncSession = Depends(get_db), user_id: int 
     history = []
 
     for ref in refs:
-        ru = (await db.execute(select(User).where(User.id == ref.referred_id))).scalars().first()
+        ru = await get_user_by_id(db, ref.referred_id)
         if not ru:
             continue
 
@@ -1492,8 +1468,7 @@ async def get_referral_history(db: AsyncSession = Depends(get_db), user_id: int 
 
 @app.post("/referral/check-reward")
 async def check_and_grant_referral_reward(db: AsyncSession = Depends(get_db), user_id: int = Depends(get_current_user)):
-    user_result = await db.execute(select(User).where(User.id == user_id))
-    user = user_result.scalars().first()
+    user = await get_user_by_id(db, user_id)
     
     if not user or (user.profile_completed or 0) < 100:
         return {"rewarded": False, "message": "Profile not yet 100%"}
@@ -1521,6 +1496,7 @@ async def check_and_grant_referral_reward(db: AsyncSession = Depends(get_db), us
     elif done_count == 10:
         coins += 50
         
+    from crud import _credit_coins
     await _credit_coins(db, ref_row.referrer_id, coins, f"Referral reward: {coins} Apna Coins")
     await db.commit()
     
@@ -1529,8 +1505,7 @@ async def check_and_grant_referral_reward(db: AsyncSession = Depends(get_db), us
 
 @app.get("/wallet/info")
 async def get_wallet_info(db: AsyncSession = Depends(get_db), user_id: int = Depends(get_current_user)):
-    user_result = await db.execute(select(User).where(User.id == user_id))
-    user = user_result.scalars().first()
+    user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     txn_result = await db.execute(
@@ -1557,8 +1532,7 @@ async def spend_coins(payload: dict, db: AsyncSession = Depends(get_db), user_id
     description = payload.get("description", "Coins spent")
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
-    user_result = await db.execute(select(User).where(User.id == user_id))
-    user = user_result.scalars().first()
+    user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     if (user.coin_balance or 0) < amount:
@@ -1577,7 +1551,7 @@ async def referral_leaderboard(db: AsyncSession = Depends(get_db), user_id: int 
     counts = Counter(refs_res.scalars().all())
     board = []
     for rid, cnt in counts.most_common(10):
-        u = (await db.execute(select(User).where(User.id == rid))).scalars().first()
+        u = await get_user_by_id(db, rid)
         if u:
             board.append({
                 "name": u.first_name,
@@ -1668,17 +1642,13 @@ async def send_otp(
 ):
     """
     Step 1 – Request an OTP for a given email.
-    - Generates a fresh 6-digit OTP
-    - Stores it in otp_codes table (expires in 5 min)
-    - Sends it to the user's inbox
-    - Invalidates any previously issued, unused OTPs for that email
     """
     email = data.email.lower().strip()
 
-    # Invalidate all previous unused OTPs for this email
+    # Invalidate all previous unused OTPs for this email using dynamic pgp_sym_decrypt
     prev_result = await db.execute(
         select(OTPCode).where(
-            OTPCode.email == email,
+            func.pgp_sym_decrypt(OTPCode.email_encrypted, PG_SECRET) == email,
             OTPCode.is_used == False,
         )
     )
@@ -1689,8 +1659,9 @@ async def send_otp(
     otp = _generate_otp()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     print(f"\n[DEBUG] Generated OTP for {email}: {otp}\n")
+    
     new_otp = OTPCode(
-        email=email,
+        email_encrypted=func.pgp_sym_encrypt(email, PG_SECRET), # 🔥 ENCRYPT ON INSERT
         otp_code=otp,
         expires_at=expires_at,
         is_used=False,
@@ -1699,9 +1670,6 @@ async def send_otp(
     await db.commit()
 
     # ── Send OTP ──────────────────────────────────────────────────────
-    # If real SMTP credentials exist → try to send real email.
-    # On any failure (or unconfigured SMTP) → fall back to DEV MODE:
-    # the OTP is printed to the Uvicorn terminal so you can still test.
     smtp_ok = _smtp_is_configured()
     email_sent = False
 
@@ -1710,12 +1678,10 @@ async def send_otp(
             await _send_otp_email(email, otp)
             email_sent = True
         except Exception as exc:
-            # SMTP failed — log warning and fall through to console print
             print(f"[send-otp] WARNING: SMTP send failed: {exc}")
             print("[send-otp] Falling back to DEV MODE - OTP printed below.")
 
     if not email_sent:
-        # ── DEV / CONSOLE MODE ────────────────────────────────────────
         print("\n" + "=" * 56)
         print(f"  [EMAIL] OTP for {email}")
         print(f"  [CODE]  {otp}")
@@ -1740,8 +1706,6 @@ async def verify_otp(
 ):
     """
     Step 2 – Verify the OTP submitted by the user.
-    Returns 200 with proceed flag on success, 400/410 on failure.
-    After success the frontend is free to call /register.
     """
     email = data.email.lower().strip()
     now = datetime.now(timezone.utc)
@@ -1750,7 +1714,7 @@ async def verify_otp(
     result = await db.execute(
         select(OTPCode)
         .where(
-            OTPCode.email == email,
+            func.pgp_sym_decrypt(OTPCode.email_encrypted, PG_SECRET) == email,
             OTPCode.is_used == False,
         )
         .order_by(OTPCode.created_at.desc())
@@ -1803,9 +1767,6 @@ async def submit_support_ticket(
 ):
     """
     Public endpoint — no authentication required, anyone can submit a ticket.
-    'description' from the frontend is stored as 'issue' in the DB.
-    'priority'   from the frontend is stored as 'urgency' in the DB.
-    email_verified is automatically resolved by checking the users table.
     """
     ticket = await create_support_ticket(
         db=db,
@@ -1869,15 +1830,14 @@ async def forgot_password_send_otp(
     email = data.email.lower().strip()
 
     # 1. Verify the user actually exists before sending an OTP
-    result = await db.execute(select(User).where(User.email == email))
-    user = result.scalars().first()
+    user = await get_user_by_email(db, email)
     
     if not user:
         raise HTTPException(status_code=404, detail="No account found with this email.")
 
     # 2. Invalidate previous unused OTPs for this email
     prev_result = await db.execute(
-        select(OTPCode).where(OTPCode.email == email, OTPCode.is_used == False)
+        select(OTPCode).where(func.pgp_sym_decrypt(OTPCode.email_encrypted, PG_SECRET) == email, OTPCode.is_used == False)
     )
     for old_otp in prev_result.scalars().all():
         old_otp.is_used = True
@@ -1890,7 +1850,7 @@ async def forgot_password_send_otp(
     print(f"\n[DEBUG] Forgot Password OTP for {email}: {otp}\n")
     
     new_otp = OTPCode(
-        email=email,
+        email_encrypted=func.pgp_sym_encrypt(email, PG_SECRET),
         otp_code=otp,
         expires_at=expires_at,
         is_used=False,
@@ -1935,7 +1895,7 @@ async def reset_password(
     # 1. Fetch the latest unused OTP
     result = await db.execute(
         select(OTPCode)
-        .where(OTPCode.email == email, OTPCode.is_used == False)
+        .where(func.pgp_sym_decrypt(OTPCode.email_encrypted, PG_SECRET) == email, OTPCode.is_used == False)
         .order_by(OTPCode.created_at.desc())
         .limit(1)
     )
@@ -1957,8 +1917,7 @@ async def reset_password(
     otp_record.is_used = True
 
     # 4. Fetch User and update password
-    user_res = await db.execute(select(User).where(User.email == email))
-    user = user_res.scalars().first()
+    user = await get_user_by_email(db, email)
     
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
@@ -2022,9 +1981,106 @@ async def search_users_by_name(
         if visibility == "premium_only":
             continue # Hide premium-only profiles from global free search
 
-        user_data = u.__dict__.copy()
-        user_data.pop("_sa_instance_state", None)
-        user_data.pop("password", None)
-        safe_users.append(user_data)
+        safe_users.append(sanitize_user_dict(u))
 
     return safe_users
+
+
+# =====================
+# ACCOUNT DEACTIVATION & DELETION
+# =====================
+
+@app.post("/account/deactivate")
+async def deactivate_account_endpoint(
+    data: DeactivateAccountRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user)
+):
+    """
+    Deactivate user account. User can reactivate within 30 days.
+    """
+    try:
+        # Get user details
+        user = await get_user_by_id(db, user_id)
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Deactivate account
+        deactivation_result = await deactivate_account(db, user_id, reason=data.reason)
+        
+        if deactivation_result:
+            # Send email notification
+            send_deactivation_email(
+                user.email,
+                user.first_name,
+                deactivation_result["reactivation_deadline"]
+            )
+            
+            return {
+                "status": "deactivated",
+                "message": "Account deactivated successfully. You can reactivate within 30 days.",
+                "reactivation_deadline": deactivation_result["reactivation_deadline"],
+                "email": user.email
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deactivating account: {str(e)}")
+
+
+@app.post("/account/delete")
+async def delete_account_endpoint(
+    data: DeleteAccountRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user)
+):
+    """
+    Permanently delete user account. Requires password verification.
+    """
+    try:
+        # Get user
+        user = await get_user_by_id(db, user_id)
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Verify password
+        if not verify_password(data.password, user.password):
+            raise HTTPException(status_code=401, detail="Incorrect password. Account deletion cancelled.")
+        
+        # Delete account
+        deletion_result = await delete_account_permanently(db, user_id, reason=data.reason)
+        
+        if deletion_result:
+            # Send email notification
+            send_deletion_email(user.email, user.first_name)
+            
+            return {
+                "status": "deleted",
+                "message": "Account permanently deleted. You will be logged out shortly.",
+                "email": user.email
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting account: {str(e)}")
+
+
+@app.get("/account/deactivation-status")
+async def get_deactivation_status(
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user)
+):
+    """
+    Check if user account is deactivated and get reactivation deadline.
+    """
+    user = await get_user_by_id(db, user_id)
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {
+        "is_deactivated": user.is_deactivated,
+        "deactivation_date": user.deactivation_date,
+        "reactivation_deadline": user.reactivation_deadline,
+        "is_active": user.is_active
+    }
