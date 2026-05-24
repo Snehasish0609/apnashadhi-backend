@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, Date, Boolean, UniqueConstraint, LargeBinary
+from sqlalchemy import Column, Integer, Float, String, ForeignKey, DateTime, Text, Date, Boolean, UniqueConstraint, LargeBinary
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from db import Base
@@ -9,6 +9,11 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     first_name = Column(String, nullable=False)
     last_name = Column(String, nullable=False)
+
+    # ... your other columns ...
+    
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
     
     # 🔥 PGCrypto Encrypted Fields (Replaces plain text email and mobile_no)
     email_encrypted = Column(LargeBinary, nullable=False)
@@ -150,6 +155,12 @@ class Report(Base):
     reporter_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     reported_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     reason = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    source = Column(String, nullable=False, default="chat")  # chat / profile / message
+    status = Column(String, nullable=False, default="pending", server_default="pending")  # pending / under_review / resolved
+    severity_score = Column(Integer, nullable=False, default=1)
+    admin_notes = Column(Text, nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 class Transaction(Base):
@@ -273,3 +284,14 @@ class DeletedAccount(Base):
     @mobile_no.setter
     def mobile_no(self, value):
         self._mobile_no = value
+
+# -------------------------------------------Admin Starts Here ----------------------------------------------------- 
+class Admin(Base):
+    __tablename__ = "admins"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    password = Column(String, nullable=False)
+    is_superadmin = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

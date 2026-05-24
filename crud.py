@@ -1,3 +1,4 @@
+import httpx
 import random
 import string
 import os
@@ -7,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func, and_, or_
 from models import User, Message, Referral, Transaction, SupportTicket, BlockedUser, DeactivatedAccount, DeletedAccount, OTPCode
 from auth import hash_password, verify_password
-
+from models import Admin, Report
 PG_SECRET = os.getenv("PG_SECRET_KEY", "Apnashaadi.in123")
 
 # =====================
@@ -97,6 +98,54 @@ async def generate_unique_referral_code(db: AsyncSession, first_name: str) -> st
             return code
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
+
+async def get_coordinates_from_city(city: str, state: str = None) -> tuple[float, float]:
+    """
+    Takes a city and state, calls OpenStreetMap Nominatim, and returns (latitude, longitude).
+    Fixed: uses httpx params dict for proper URL encoding (spaces/commas in city names
+    were previously breaking the request).
+    """
+    try:
+        # Build the search query
+        query = f"{city}, {state}, India" if state else f"{city}, India"
+        
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            headers = {"User-Agent": "ApnaShaadi/1.0 (care@apnasaadhi.com)"}
+            # 🔥 KEY FIX: use params= dict so httpx URL-encodes the query automatically.
+            # Previously we put the raw string directly in the URL which broke on spaces/commas.
+            response = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "format": "json",
+                    "q": query,
+                    "limit": "1",
+                    "countrycodes": "in",
+                },
+                headers=headers,
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            if data and len(data) > 0:
+                lat = float(data[0]["lat"])
+                lon = float(data[0]["lon"])
+                # Sanity check: valid India bounding box (lat 6–38, lon 66–98)
+                # Rejects Null Island (0,0) and overseas mismatches
+                if 6.0 <= lat <= 38.0 and 66.0 <= lon <= 98.0:
+                    print(f"[Geocode] ✅ '{city}' → ({lat}, {lon})")
+                    return lat, lon
+                else:
+                    print(f"[Geocode] ⚠️ Result for '{city}' outside India: ({lat}, {lon}) — skipped")
+                
+    except httpx.ConnectTimeout:
+        print(f"[Geocode] Nominatim timed out for city: '{city}'")
+    except httpx.HTTPStatusError as e:
+        print(f"[Geocode] HTTP error for '{city}': {e.response.status_code}")
+    except Exception as e:
+        print(f"[Geocode] Failed for '{city}': {e}")
+        
+    return None, None
+
 async def create_user(db: AsyncSession, user):
     referrer = None
     if getattr(user, 'referred_by_code', None):
@@ -106,6 +155,13 @@ async def create_user(db: AsyncSession, user):
         referrer = ref_result.scalars().first()
 
     new_code = await generate_unique_referral_code(db, user.first_name)
+
+    # 🔥 Fetch GPS coordinates based on the City and State they typed in the registration form
+    lat, lon = await get_coordinates_from_city(user.city, getattr(user, 'state', None))
+
+
+    # 🎁 New referred user gets 5 welcome coins if they were referred by someone
+    welcome_coins = 5 if referrer else 0
 
     db_user = User(
         first_name=user.first_name, last_name=user.last_name, 
@@ -128,17 +184,68 @@ async def create_user(db: AsyncSession, user):
         account_created_by=getattr(user, 'account_created_by', None),
         terms_accepted=getattr(user, 'terms_accepted', False) or False,
         is_active=True, referral_code=new_code,
-        referred_by=referrer.id if referrer else None, coin_balance=0,
+        referred_by=referrer.id if referrer else None,
+        coin_balance=welcome_coins,  # 🎁 5 coins credited immediately if referred
+	
+	# 🔥 Automatically save the generated coordinates at registration!
+        latitude=lat,
+        longitude=lon,
     )
 
-    db_user.profile_completed = calculate_profile_score(db_user)
+    db_user.profile_completed = int(calculate_profile_score(db_user))  # type: ignore[assignment]
 
     db.add(db_user)
     await db.flush()
 
     if referrer:
-        new_referral = Referral(referrer_id=referrer.id, referred_id=db_user.id)
+        # ── Count how many successful referrals the referrer already has ──
+        done_count_res = await db.execute(
+            select(Referral).where(
+                Referral.referrer_id == referrer.id,
+                Referral.reward_given == True,
+            )
+        )
+        done_count = len(done_count_res.scalars().all()) + 1  # +1 for this new referral
+
+        # ── Referrer gets 10 coins immediately on registration ──
+        referrer_coins = 10
+        description_parts = [f"Referral reward: {db_user.first_name} joined with your code"]
+
+        # ── Milestone bonuses ──
+        if done_count == 5:
+            referrer_coins += 20
+            description_parts.append("+20 milestone bonus (5 referrals! 🔥)")
+        elif done_count == 10:
+            referrer_coins += 50
+            description_parts.append("+50 milestone bonus (10 referrals! ⚡)")
+
+        # Credit coins to referrer
+        ref_user_res = await db.execute(select(User).where(User.id == referrer.id))
+        ref_user = ref_user_res.scalars().first()
+        if ref_user:
+            ref_user.coin_balance = (ref_user.coin_balance or 0) + referrer_coins
+            referrer_txn = Transaction(
+                user_id=referrer.id,
+                amount=referrer_coins,
+                description=" | ".join(description_parts)
+            )
+            db.add(referrer_txn)
+
+        # Create the referral record — mark reward_given=True since we credited immediately
+        new_referral = Referral(
+            referrer_id=referrer.id,
+            referred_id=db_user.id,
+            reward_given=True,  # ✅ Already credited above
+        )
         db.add(new_referral)
+
+        # 🎁 Record the 5-coin welcome transaction for the referred user
+        welcome_txn = Transaction(
+            user_id=db_user.id,
+            amount=welcome_coins,
+            description=f"Welcome bonus: Joined via referral code {referrer.referral_code}"
+        )
+        db.add(welcome_txn)
 
     await db.commit()
     await db.refresh(db_user)
@@ -194,8 +301,8 @@ async def get_all_users(db: AsyncSession, current_user_id: int):
 
 
 async def save_message(
-    db: AsyncSession, sender_id: int, receiver_id: int, 
-    message: str = None, media_url: str = None, media_type: str = None
+    db: AsyncSession, sender_id: int, receiver_id: int,
+    message: str | None = None, media_url: str | None = None, media_type: str | None = None
 ):
     encrypted_msg = func.pgp_sym_encrypt(message, PG_SECRET) if message else None
 
@@ -249,7 +356,11 @@ async def update_user_presence(db: AsyncSession, user_id: int, is_online: bool):
     )
     await db.commit()
 
-async def credit_coins(db: AsyncSession, user_id: int, amount: int, description: str):
+
+# Alias used throughout main.py referral reward logic
+async def _credit_coins(db: AsyncSession, user_id: int, amount: int, description: str):
+    """Atomic coin credit — updates balance + inserts a Transaction row.
+    Does NOT call db.commit() — caller must commit after calling this."""
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalars().first()
     if user:
@@ -258,6 +369,9 @@ async def credit_coins(db: AsyncSession, user_id: int, amount: int, description:
         db.add(txn)
         return True
     return False
+
+# Private alias used by main.py imports
+_credit_coins = _credit_coins
 
 async def create_support_ticket(db: AsyncSession, email: str, subject: str, category: str, urgency: str, issue: str) -> SupportTicket:
     user = await get_user_by_email(db, email)
@@ -431,6 +545,127 @@ async def check_deactivation_deadline(db: AsyncSession):
     expired_accounts = result.scalars().all()
     
     for account in expired_accounts:
-        await delete_account_permanently(db, account.user_id, reason="Deactivation deadline expired")
+        await delete_account_permanently(db, int(account.user_id), reason="Deactivation deadline expired")  # type: ignore[arg-type]
     
     return len(expired_accounts) if expired_accounts else 0
+
+# -------------------------------------------Admin Starts Here ----------------------------------------------------- 
+async def create_admin_user(db: AsyncSession, admin_data):
+    db_admin = Admin(
+        username=admin_data.username.lower().strip(),
+        email=admin_data.email.lower().strip(),
+        password=hash_password(admin_data.password),
+        is_superadmin=admin_data.is_superadmin
+    )
+    db.add(db_admin)
+    await db.commit()
+    await db.refresh(db_admin)
+    return db_admin
+
+async def authenticate_admin(db: AsyncSession, username: str, password: str):
+    result = await db.execute(select(Admin).where(Admin.username == username.lower().strip()))
+    admin = result.scalars().first()
+    if not admin or not verify_password(password, str(admin.password)):  # type: ignore[arg-type]
+        return None
+    return admin
+
+# --- ADMIN DASHBOARD DATA ---
+async def get_admin_dashboard_stats(db: AsyncSession):
+    # Total Users
+    total_users_res = await db.execute(select(func.count(User.id)))
+    total_users = total_users_res.scalar() or 0
+
+    # Active Subscriptions (assuming 'free' is no sub)
+    active_subs_res = await db.execute(select(func.count(User.id)).where(User.plan_type != 'free'))
+    active_subs = active_subs_res.scalar() or 0
+
+    # Banned Users
+    banned_res = await db.execute(select(func.count(User.id)).where(User.is_active == False))
+    banned_users = banned_res.scalar() or 0
+
+    # Total Reports
+    reports_res = await db.execute(select(func.count(Report.id)))
+    total_reports = reports_res.scalar() or 0
+
+    return {
+        "total_users": total_users,
+        "active_subscriptions": active_subs,
+        "banned_users": banned_users,
+        "total_reports": total_reports
+    }
+
+async def get_all_users_for_admin(db: AsyncSession):
+    """Fetches all users with decrypted PII for the admin table"""
+    result = await db.execute(
+        select(
+            User.id,
+            User.first_name,
+            User.last_name,
+            func.pgp_sym_decrypt(User.email_encrypted, PG_SECRET).label("email"),
+            func.pgp_sym_decrypt(User.mobile_encrypted, PG_SECRET).label("mobile_no"),
+            User.plan_type,
+            User.is_active,
+            User.created_at
+        ).order_by(User.created_at.desc())
+    )
+    return [dict(r._mapping) for r in result.all()]
+
+async def toggle_user_ban_status(db: AsyncSession, user_id: int):
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        return None
+    
+    # Toggle the active status
+    user.is_active = not user.is_active
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+def calculate_severity_score(reason: str) -> int:
+    reason_map = {
+        "Scam/Fraud": 5,
+        "Harassment": 5,
+        "Inappropriate Content": 4,
+        "Fake Profile": 3,
+        "Religious Misrepresentation": 3,
+        "Spam": 2,
+        "Other": 1
+    }
+    return reason_map.get(reason, 1)
+
+async def check_duplicate_report(db: AsyncSession, reporter_id: int, target_user_id: int) -> bool:
+    res = await db.execute(
+        select(Report).where(
+            Report.reporter_id == reporter_id,
+            Report.reported_user_id == target_user_id,
+            Report.status == "pending"
+        )
+    )
+    return res.scalars().first() is not None
+
+async def get_all_reports_for_admin(db: AsyncSession):
+    result = await db.execute(
+        select(Report).order_by(Report.created_at.desc())
+    )
+    reports = result.scalars().all()
+    
+    detailed_reports = []
+    for r in reports:
+        reporter = await get_user_by_id(db, int(r.reporter_id))  # type: ignore[arg-type]
+        reported = await get_user_by_id(db, int(r.reported_user_id))  # type: ignore[arg-type]
+        detailed_reports.append({
+            "id": r.id,
+            "reporter_id": r.reporter_id,
+            "reporter_name": f"{reporter.first_name} {reporter.last_name}" if reporter else f"User #{r.reporter_id}",
+            "reported_user_id": r.reported_user_id,
+            "reported_user_name": f"{reported.first_name} {reported.last_name}" if reported else f"User #{r.reported_user_id}",
+            "reason": r.reason,
+            "description": r.description,
+            "source": r.source,
+            "status": r.status,
+            "severity_score": r.severity_score,
+            "admin_notes": r.admin_notes,
+            "resolved_at": r.resolved_at,
+            "created_at": r.created_at
+        })
+    return detailed_reports
