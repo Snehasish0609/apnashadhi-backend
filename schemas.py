@@ -353,3 +353,11 @@ class ReportDetailsOut(BaseModel):
     reported_user_name: str
     reason: str
     created_at: datetime
+
+class ReportCreate(BaseModel):
+    reported_user_id: int
+    reason: str
+
+class AdminReportAction(BaseModel):
+    action: str  # e.g., 'ban', 'warn', 'dismiss'
+    admin_notes: str | None = None
