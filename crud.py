@@ -7,7 +7,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func, and_, or_
-from models import User, Message, Referral, Transaction, SupportTicket, BlockedUser, DeactivatedAccount, DeletedAccount, OTPCode
+from models import User, Message, Referral, Transaction, SupportTicket, BlockedUser, DeactivatedAccount, DeletedAccount, OTPCode,Report
 from auth import hash_password, verify_password
 from models import Admin, Report
 from sqlalchemy import func, cast, Date, select
@@ -580,6 +580,29 @@ async def check_deactivation_deadline(db: AsyncSession):
     
     return len(expired_accounts) if expired_accounts else 0
 
+
+def calculate_severity_score(reason: str) -> int:
+    reason_map = {
+        "Scam/Fraud": 5,
+        "Harassment": 5,
+        "Inappropriate Content": 4,
+        "Fake Profile": 3,
+        "Religious Misrepresentation": 3,
+        "Spam": 2,
+        "Other": 1
+    }
+    return reason_map.get(reason, 1)
+
+async def check_duplicate_report(db: AsyncSession, reporter_id: int, target_user_id: int) -> bool:
+    res = await db.execute(
+        select(Report).where(
+            Report.reporter_id == reporter_id,
+            Report.reported_user_id == target_user_id,
+            Report.status == "pending"
+        )
+    )
+    return res.scalars().first() is not None
+
 # -------------------------------------------Admin Starts Here ----------------------------------------------------- 
 async def create_admin_user(db: AsyncSession, admin_data):
     db_admin = Admin(
@@ -634,15 +657,9 @@ async def toggle_user_ban_status(db: AsyncSession, user_id: int):
 
 async def get_all_reports_for_admin(db: AsyncSession):
     result = await db.execute(
-        select(
-            Report.id,
-            Report.reporter_id,
-            Report.reported_user_id,
-            Report.reason,
-            Report.created_at
-        ).order_by(Report.created_at.desc())
+        select(Report).order_by(Report.created_at.desc())
     )
-    reports = result.all()
+    reports = result.scalars().all()
     
     detailed_reports = []
     for r in reports:
@@ -651,10 +668,16 @@ async def get_all_reports_for_admin(db: AsyncSession):
         detailed_reports.append({
             "id": r.id,
             "reporter_id": r.reporter_id,
-            "reporter_name": f"{reporter.first_name} {reporter.last_name}" if reporter else "Unknown",
+            "reporter_name": f"{reporter.first_name} {reporter.last_name}" if reporter else f"User #{r.reporter_id}",
             "reported_user_id": r.reported_user_id,
-            "reported_user_name": f"{reported.first_name} {reported.last_name}" if reported else "Unknown",
+            "reported_user_name": f"{reported.first_name} {reported.last_name}" if reported else f"User #{r.reported_user_id}",
             "reason": r.reason,
+            "description": r.description,
+            "source": r.source,
+            "status": r.status,
+            "severity_score": r.severity_score,
+            "admin_notes": r.admin_notes,
+            "resolved_at": r.resolved_at,
             "created_at": r.created_at
         })
     return detailed_reports
@@ -853,3 +876,56 @@ async def get_admin_settings_data(db: AsyncSession):
         # later update from login history table
         "last_login": "Recently Logged In"
     }
+
+async def get_all_complaints(db: AsyncSession):
+
+    result = await db.execute(
+        select(
+            SupportTicket,
+            func.pgp_sym_decrypt(SupportTicket.email_encrypted, PG_SECRET).label("email_dec")
+        )
+        .order_by(SupportTicket.created_at.desc())
+    )
+
+    rows = result.all()
+
+    data = []
+
+    for row in rows:
+        t = row[0]
+        email_dec = row.email_dec
+
+        data.append({
+            "id": t.id,
+            "userId": t.user_id,
+            "user": email_dec or "Unknown User",
+            "date": t.created_at.strftime("%Y-%m-%d") if t.created_at else None,
+            "issue": t.issue,
+            "status": "Replied" if t.admin_reply else "Pending",
+            "adminReply": t.admin_reply
+        })
+
+    return data
+
+async def reply_complaint(
+    db: AsyncSession,
+    complaint_id: int,
+    reply: str
+):
+
+    result = await db.execute(
+        select(SupportTicket)
+        .where(SupportTicket.id == complaint_id)
+    )
+
+    ticket = result.scalar_one_or_none()
+
+    if not ticket:
+        return None
+
+    ticket.admin_reply = reply
+
+    await db.commit()
+    await db.refresh(ticket)
+
+    return ticket

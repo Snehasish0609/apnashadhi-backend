@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, validator
 from datetime import date, datetime
 from typing import Dict, List, Optional
 
@@ -305,6 +305,50 @@ class ReactivateAccountResponse(BaseModel):
     user_id: int
     email: str
     status: str  # "reactivated"
+    
+
+
+class ReportDetailsOut(BaseModel):
+    id: int
+    reporter_id: int
+    reporter_name: str
+    reported_user_id: int
+    reported_user_name: str
+    reason: str
+    description: str | None = None
+    source: str = "chat"
+    status: str = "pending"
+    severity_score: int = 1
+    admin_notes: str | None = None
+    resolved_at: datetime | None = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class ReportCreate(BaseModel):
+    reported_user_id: int
+    reason: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    source: str = Field(default="chat", max_length=50)  # chat / profile / message
+
+    @validator("reason")
+    def validate_reason(cls, v):
+        allowed = {
+            "Fake Profile", "Spam", "Harassment", "Scam/Fraud",
+            "Religious Misrepresentation", "Inappropriate Content", "Other"
+        }
+        if v not in allowed:
+            raise ValueError(f"Reason must be one of: {', '.join(allowed)}")
+        return v
+
+    @validator("source")
+    def validate_source(cls, v):
+        allowed = {"chat", "profile", "message"}
+        if v not in allowed:
+            raise ValueError(f"Source must be one of: {', '.join(allowed)}")
+        return v
+    
 
 # -------------------------------------------Admin Starts Here ----------------------------------------------------- 
 class AdminCreate(BaseModel):
@@ -345,19 +389,29 @@ class AdminUserList(BaseModel):
     class Config:
         from_attributes = True
 
-class ReportDetailsOut(BaseModel):
-    id: int
-    reporter_id: int
-    reporter_name: str
-    reported_user_id: int
-    reported_user_name: str
-    reason: str
-    created_at: datetime
+# class ReportDetailsOut(BaseModel):
+#     id: int
+#     reporter_id: int
+#     reporter_name: str
+#     reported_user_id: int
+#     reported_user_name: str
+#     reason: str
+#     created_at: datetime
 
-class ReportCreate(BaseModel):
-    reported_user_id: int
-    reason: str
+# class ReportCreate(BaseModel):
+#     reported_user_id: int
+#     reason: str
 
 class AdminReportAction(BaseModel):
-    action: str  # e.g., 'ban', 'warn', 'dismiss'
+    action: str = Field(min_length=1)  # resolve / dismiss / under_review / ban / warn / delete_account
     admin_notes: str | None = None
+
+    @validator("action")
+    def validate_action(cls, v):
+        allowed = {"resolve", "dismiss", "under_review","unban", "ban", "warn", "delete_account"}
+        if v not in allowed:
+            raise ValueError(f"Action must be one of: {', '.join(allowed)}")
+        return v
+    
+class ComplaintReply(BaseModel):
+    reply: str

@@ -6,6 +6,7 @@ import random
 import string
 import httpx 
 
+from crud import check_duplicate_report, calculate_severity_score
 from pydantic import BaseModel
 from schemas import AadhaarInitRequest, AadhaarVerifyRequest
 
@@ -2994,6 +2995,7 @@ async def get_deactivation_status(
 # =====================================================================
 
 
+
 from crud import (
     create_admin_user,
     authenticate_admin,
@@ -3148,6 +3150,149 @@ async def admin_settings(
 ):
     return await get_admin_settings_data(db)
 
+# ==========================================
+# ADMIN REPORTS CONSOLE ACTIONS ROUTE
+# ==========================================
+@app.post("/admin/reports/{report_id}/action", tags=["Admin System"])
+async def admin_report_action(
+    report_id: int,
+    payload: AdminReportAction,
+    db: AsyncSession = Depends(get_db),
+    admin_id: int = Depends(get_current_admin)
+):
+    from models import Report
+    from crud import delete_account_permanently, get_user_by_id
 
+    # Fetch report
+    res = await db.execute(
+        select(Report).where(Report.id == report_id)
+    )
 
-# Safety & Moderation Pipeline Integrity Verified
+    report = res.scalars().first()
+
+    if not report:
+        raise HTTPException(
+            status_code=404,
+            detail="Report not found"
+        )
+
+    action = payload.action
+    report.admin_notes = payload.admin_notes
+
+    # =====================================
+    # RESOLVE
+    # =====================================
+    if action == "resolve":
+
+        report.status = "resolved"
+        report.resolved_at = datetime.now()
+
+    # =====================================
+    # DISMISS
+    # =====================================
+    elif action == "dismiss":
+
+        report.status = "dismissed"
+        report.resolved_at = datetime.now()
+
+    # =====================================
+    # UNDER REVIEW
+    # =====================================
+    elif action == "under_review":
+
+        report.status = "under_review"
+
+    # =====================================
+    # BAN USER
+    # =====================================
+    elif action == "ban":
+
+        user = await get_user_by_id(
+            db,
+            report.reported_user_id
+        )
+
+        if user:
+            user.is_active = False
+
+        report.status = "resolved"
+        report.resolved_at = datetime.now()
+
+    # =====================================
+    # UNBAN USER
+    # =====================================
+    elif action == "unban":
+
+        user = await get_user_by_id(
+            db,
+            report.reported_user_id
+        )
+
+        if user:
+            user.is_active = True
+
+        report.status = "resolved"
+        report.resolved_at = datetime.now()
+
+    # =====================================
+    # WARN USER
+    # =====================================
+    elif action == "warn":
+
+        report.status = "resolved"
+        report.resolved_at = datetime.now()
+
+    # =====================================
+    # DELETE ACCOUNT
+    # =====================================
+    elif action == "delete_account":
+
+        await delete_account_permanently(
+            db,
+            report.reported_user_id,
+            reason=f"Report #{report_id}"
+        )
+
+        report.status = "resolved"
+        report.resolved_at = datetime.now()
+
+    await db.commit()
+
+    return {
+        "message": f"Successfully performed action '{action}' on report #{report_id}"
+    }
+
+from schemas import ComplaintReply
+from crud import (
+    get_all_complaints,
+    reply_complaint
+)
+
+@app.get("/api/admin/complaints")
+async def admin_complaints(
+    db: AsyncSession = Depends(get_db),
+    admin_id: int = Depends(get_current_admin)
+):
+    return await get_all_complaints(db)
+
+@app.post("/api/admin/complaints/{complaint_id}/reply")
+async def admin_reply_complaint(
+    complaint_id: int,
+    data: ComplaintReply,
+    db: AsyncSession = Depends(get_db),
+    admin_id: int = Depends(get_current_admin)
+):
+
+    ticket = await reply_complaint(
+        db,
+        complaint_id,
+        data.reply
+    )
+
+    if not ticket:
+        raise HTTPException(
+            status_code=404,
+            detail="Complaint not found"
+        )
+
+    return {"message": "Reply sent"}

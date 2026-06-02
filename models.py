@@ -298,3 +298,4 @@ class Admin(Base):
     password = Column(String, nullable=False)
     is_superadmin = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
