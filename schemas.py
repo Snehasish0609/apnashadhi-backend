@@ -2,13 +2,13 @@ from pydantic import BaseModel, EmailStr, Field, field_validator, validator
 from datetime import date, datetime
 from typing import Dict, List, Optional
 
-class AadhaarInitRequest(BaseModel):
-    aadhaar_number: str
-    # Note: no mobile field needed — UIDAI sends OTP to the mobile registered with this Aadhaar
+# class AadhaarInitRequest(BaseModel):
+#     aadhaar_number: str
+#     # Note: no mobile field needed — UIDAI sends OTP to the mobile registered with this Aadhaar
 
-class AadhaarVerifyRequest(BaseModel):
-    ref_id: str
-    otp: str
+# class AadhaarVerifyRequest(BaseModel):
+#     ref_id: str
+#     otp: str
 
 class RegisterUser(BaseModel):
     # Required
@@ -110,15 +110,19 @@ class LoginUser(BaseModel):
     mobile_no: str | None = None
     password: str
 
+
 class UserResponse(BaseModel):
     id: int
     first_name: str
     last_name: str
     email: EmailStr
-    profile_completed: int | None = 0 # Added to track progress in response
+    profile_completed: int | None = 0
+    is_aadhaar_verified: bool
+    aadhaar_manual_status: str | None = "unverified"
 
     class Config:
         from_attributes = True
+
 
 class UserOut(BaseModel):
     id: int

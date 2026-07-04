@@ -4,11 +4,17 @@ import shutil
 import os
 import random
 import string
-import httpx 
+import httpx
+import uuid
+import aiofiles
+import os
+
+from fastapi import UploadFile, File, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from crud import check_duplicate_report, calculate_severity_score
 from pydantic import BaseModel
-from schemas import AadhaarInitRequest, AadhaarVerifyRequest
 
 from contextlib import asynccontextmanager
 
@@ -117,6 +123,8 @@ async def lifespan(app_instance: FastAPI):
             # Selfie / face verification
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_selfie_verified BOOLEAN NOT NULL DEFAULT false;",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS face_embedding TEXT;",
+            # Aadhaar manual upload timestamp (real upload time)
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS aadhaar_uploaded_at TIMESTAMPTZ;",
         ]
         for sql in migrations:
             await conn.execute(text(sql))
@@ -146,11 +154,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # =====================
 # SERVE STATIC FILES (IMAGES)
 # =====================
-os.makedirs("uploads", exist_ok=True) # Ensure folder exists before mounting
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_UPLOADS_DIR = os.path.join(_BASE_DIR, "uploads")
+os.makedirs(_UPLOADS_DIR, exist_ok=True)  # Ensure folder exists before mounting
+app.mount("/uploads", StaticFiles(directory=_UPLOADS_DIR), name="uploads")
 
 # =====================
 # DB DEPENDENCY
@@ -249,171 +260,217 @@ async def login_bypass_active(
 #   4. To go live: complete KYC with Setu and switch to production credentials
 # =====================================================================
 
-SETU_CLIENT_ID           = os.getenv("SETU_CLIENT_ID", "")
-SETU_CLIENT_SECRET       = os.getenv("SETU_CLIENT_SECRET", "")
-SETU_PRODUCT_INSTANCE_ID = os.getenv("SETU_PRODUCT_INSTANCE_ID", "")
-# Sandbox: https://dg.setu.co  |  Production: https://dg.setu.co (same URL, different credentials)
-SETU_BASE_URL            = os.getenv("SETU_BASE_URL", "https://dg.setu.co")
+# SETU_CLIENT_ID           = os.getenv("SETU_CLIENT_ID", "")
+# SETU_CLIENT_SECRET       = os.getenv("SETU_CLIENT_SECRET", "")
+# SETU_PRODUCT_INSTANCE_ID = os.getenv("SETU_PRODUCT_INSTANCE_ID", "")
+# # Sandbox: https://dg.setu.co  |  Production: https://dg.setu.co (same URL, different credentials)
+# SETU_BASE_URL            = os.getenv("SETU_BASE_URL", "https://dg.setu.co")
 
 
-def _setu_headers() -> dict:
-    return {
-        "x-client-id": SETU_CLIENT_ID,
-        "x-client-secret": SETU_CLIENT_SECRET,
-        "x-product-instance-id": SETU_PRODUCT_INSTANCE_ID,
-        "Content-Type": "application/json",
-    }
+# def _setu_headers() -> dict:
+#     return {
+#         "x-client-id": SETU_CLIENT_ID,
+#         "x-client-secret": SETU_CLIENT_SECRET,
+#         "x-product-instance-id": SETU_PRODUCT_INSTANCE_ID,
+#         "Content-Type": "application/json",
+#     }
 
 
-def _setu_configured() -> bool:
-    return bool(SETU_CLIENT_ID and SETU_CLIENT_SECRET and SETU_PRODUCT_INSTANCE_ID)
+# def _setu_configured() -> bool:
+#     return bool(SETU_CLIENT_ID and SETU_CLIENT_SECRET and SETU_PRODUCT_INSTANCE_ID)
 
 
-@app.post("/verification/aadhaar/send-otp")
-async def init_aadhaar_verification(
-    data: AadhaarInitRequest,
+# @app.post("/verification/aadhaar/send-otp")
+# async def init_aadhaar_verification(
+#     data: AadhaarInitRequest,
+#     db: AsyncSession = Depends(get_db),
+#     user_id: int = Depends(get_current_user)
+# ):
+#     # 1. Validate Aadhaar format
+#     aadhaar = data.aadhaar_number.strip()
+#     if len(aadhaar) != 12 or not aadhaar.isdigit():
+#         raise HTTPException(status_code=400, detail="Invalid Aadhaar number. Must be exactly 12 digits.")
+
+#     # 2. Check Setu is configured
+#     if not _setu_configured():
+#         raise HTTPException(
+#             status_code=503,
+#             detail=(
+#                 "Aadhaar verification service is not configured. "
+#                 "Please set SETU_CLIENT_ID, SETU_CLIENT_SECRET and SETU_PRODUCT_INSTANCE_ID "
+#                 "in your .env.local. Get free sandbox credentials at https://bridge.setu.co"
+#             )
+#         )
+
+#     # 3. Get user
+#     user = await get_user_by_id(db, user_id)
+#     if not user:
+#         raise HTTPException(status_code=404, detail="User not found")
+#     if user.is_aadhaar_verified:
+#         raise HTTPException(status_code=400, detail="Your Aadhaar is already verified.")
+
+#     # 4. Call Setu → Setu calls UIDAI → OTP sent to Aadhaar-registered mobile
+#     try:
+#         async with httpx.AsyncClient(timeout=15.0) as client:
+#             resp = await client.post(
+#                 f"{SETU_BASE_URL}/api/v2/aadhaar-validation/aadhaar-otp/generate",
+#                 headers=_setu_headers(),
+#                 json={"aadhaar": aadhaar},
+#             )
+#     except httpx.RequestError as e:
+#         print(f"[Setu] Network error: {e}")
+#         raise HTTPException(status_code=503, detail="Could not reach verification service. Please try again.")
+
+#     if resp.status_code not in (200, 201):
+#         err = resp.json()
+#         detail = err.get("message") or err.get("error") or "Failed to initiate Aadhaar verification."
+#         print(f"[Setu] send-otp error {resp.status_code}: {err}")
+#         raise HTTPException(status_code=400, detail=detail)
+
+#     setu_data = resp.json()
+#     ref_id = setu_data.get("refId") or setu_data.get("data", {}).get("refId", "")
+#     if not ref_id:
+#         raise HTTPException(status_code=502, detail="Verification service returned an unexpected response.")
+
+#     print(f"[Setu] ✅ OTP triggered for Aadhaar ...{aadhaar[-4:]} — refId: {ref_id}")
+
+#     # 5. Store refId in otp_codes table (keyed to user email, expires in 10 min)
+#     #    The otp_code field stores Setu's refId so we can retrieve it in the verify step.
+#     await db.execute(
+#         text(
+#             "UPDATE otp_codes SET is_used = true "
+#             "WHERE pgp_sym_decrypt(email_encrypted, :secret) = :email AND is_used = false"
+#         ),
+#         {"secret": PG_SECRET, "email": user.email}
+#     )
+#     new_otp = OTPCode(
+#         email_encrypted=func.pgp_sym_encrypt(user.email, PG_SECRET),
+#         otp_code=ref_id,                                          # ← stores Setu refId
+#         expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+#         is_used=False,
+#     )
+#     db.add(new_otp)
+#     await db.commit()
+
+#     return {
+#         "message": "OTP sent to the mobile number registered with your Aadhaar by UIDAI. Check your phone.",
+#         "ref_id": "stored",   # ref_id is stored server-side; frontend doesn't need it
+#     }
+
+
+# @app.post("/verification/aadhaar/verify")
+# async def verify_aadhaar_otp(
+#     data: AadhaarVerifyRequest,
+#     db: AsyncSession = Depends(get_db),
+#     user_id: int = Depends(get_current_user)
+# ):
+#     if not _setu_configured():
+#         raise HTTPException(status_code=503, detail="Aadhaar verification service is not configured.")
+
+#     # 1. Get user
+#     user = await get_user_by_id(db, user_id)
+#     if not user:
+#         raise HTTPException(status_code=404, detail="User not found")
+#     if user.is_aadhaar_verified:
+#         raise HTTPException(status_code=400, detail="Aadhaar is already verified.")
+
+#     # 2. Retrieve the stored Setu refId from DB
+#     now = datetime.now(timezone.utc)
+#     result = await db.execute(
+#         select(OTPCode).where(
+#             func.pgp_sym_decrypt(OTPCode.email_encrypted, PG_SECRET) == user.email,
+#             OTPCode.is_used == False,
+#             OTPCode.expires_at > now,
+#         ).order_by(OTPCode.created_at.desc()).limit(1)
+#     )
+#     otp_record = result.scalars().first()
+
+#     if not otp_record:
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Verification session expired. Please click 'Get OTP' again."
+#         )
+
+#     ref_id = otp_record.otp_code   # The Setu refId stored in the generate step
+
+#     # 3. Call Setu → Setu verifies OTP with UIDAI
+#     try:
+#         async with httpx.AsyncClient(timeout=15.0) as client:
+#             resp = await client.post(
+#                 f"{SETU_BASE_URL}/api/v2/aadhaar-validation/aadhaar-otp/verify",
+#                 headers=_setu_headers(),
+#                 json={"otp": data.otp.strip(), "refId": ref_id},
+#             )
+#     except httpx.RequestError as e:
+#         print(f"[Setu] Network error during verify: {e}")
+#         raise HTTPException(status_code=503, detail="Could not reach verification service. Please try again.")
+
+#     if resp.status_code not in (200, 201):
+#         err = resp.json()
+#         detail = err.get("message") or err.get("error") or "Invalid OTP. Please check and try again."
+#         print(f"[Setu] verify error {resp.status_code}: {err}")
+#         raise HTTPException(status_code=400, detail=detail)
+
+#     # 4. Success — mark OTP as used and user as verified
+#     otp_record.is_used = True
+#     user.is_aadhaar_verified = True
+#     await db.commit()
+
+#     print(f"[Setu] ✅ User {user_id} ({user.first_name}) Aadhaar verified successfully via UIDAI.")
+
+#     return {
+#         "message": "Aadhaar verified successfully! Your profile now shows a verified badge. 🛡️",
+#         "is_aadhaar_verified": True
+#     }
+
+@app.post("/verification/aadhaar/manual-upload")
+async def manual_aadhaar_upload(
+    front_image: UploadFile = File(...),
+    back_image: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    user_id: int = Depends(get_current_user)
+    current_user = Depends(get_current_user) # 🔥 Removed the ": int" casting
 ):
-    # 1. Validate Aadhaar format
-    aadhaar = data.aadhaar_number.strip()
-    if len(aadhaar) != 12 or not aadhaar.isdigit():
-        raise HTTPException(status_code=400, detail="Invalid Aadhaar number. Must be exactly 12 digits.")
+    # 1. Extract the ID safely whether current_user is a dict, object, or int
+    user_id = current_user.id if hasattr(current_user, 'id') else current_user.get('id') if isinstance(current_user, dict) else current_user
 
-    # 2. Check Setu is configured
-    if not _setu_configured():
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Aadhaar verification service is not configured. "
-                "Please set SETU_CLIENT_ID, SETU_CLIENT_SECRET and SETU_PRODUCT_INSTANCE_ID "
-                "in your .env.local. Get free sandbox credentials at https://bridge.setu.co"
-            )
-        )
-
-    # 3. Get user
+    # 2. Fetch the user from DB
     user = await get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if user.is_aadhaar_verified:
-        raise HTTPException(status_code=400, detail="Your Aadhaar is already verified.")
-
-    # 4. Call Setu → Setu calls UIDAI → OTP sent to Aadhaar-registered mobile
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"{SETU_BASE_URL}/api/v2/aadhaar-validation/aadhaar-otp/generate",
-                headers=_setu_headers(),
-                json={"aadhaar": aadhaar},
-            )
-    except httpx.RequestError as e:
-        print(f"[Setu] Network error: {e}")
-        raise HTTPException(status_code=503, detail="Could not reach verification service. Please try again.")
-
-    if resp.status_code not in (200, 201):
-        err = resp.json()
-        detail = err.get("message") or err.get("error") or "Failed to initiate Aadhaar verification."
-        print(f"[Setu] send-otp error {resp.status_code}: {err}")
-        raise HTTPException(status_code=400, detail=detail)
-
-    setu_data = resp.json()
-    ref_id = setu_data.get("refId") or setu_data.get("data", {}).get("refId", "")
-    if not ref_id:
-        raise HTTPException(status_code=502, detail="Verification service returned an unexpected response.")
-
-    print(f"[Setu] ✅ OTP triggered for Aadhaar ...{aadhaar[-4:]} — refId: {ref_id}")
-
-    # 5. Store refId in otp_codes table (keyed to user email, expires in 10 min)
-    #    The otp_code field stores Setu's refId so we can retrieve it in the verify step.
-    await db.execute(
-        text(
-            "UPDATE otp_codes SET is_used = true "
-            "WHERE pgp_sym_decrypt(email_encrypted, :secret) = :email AND is_used = false"
-        ),
-        {"secret": PG_SECRET, "email": user.email}
-    )
-    new_otp = OTPCode(
-        email_encrypted=func.pgp_sym_encrypt(user.email, PG_SECRET),
-        otp_code=ref_id,                                          # ← stores Setu refId
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
-        is_used=False,
-    )
-    db.add(new_otp)
-    await db.commit()
-
-    return {
-        "message": "OTP sent to the mobile number registered with your Aadhaar by UIDAI. Check your phone.",
-        "ref_id": "stored",   # ref_id is stored server-side; frontend doesn't need it
-    }
-
-
-@app.post("/verification/aadhaar/verify")
-async def verify_aadhaar_otp(
-    data: AadhaarVerifyRequest,
-    db: AsyncSession = Depends(get_db),
-    user_id: int = Depends(get_current_user)
-):
-    if not _setu_configured():
-        raise HTTPException(status_code=503, detail="Aadhaar verification service is not configured.")
-
-    # 1. Get user
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        
     if user.is_aadhaar_verified:
         raise HTTPException(status_code=400, detail="Aadhaar is already verified.")
 
-    # 2. Retrieve the stored Setu refId from DB
-    now = datetime.now(timezone.utc)
-    result = await db.execute(
-        select(OTPCode).where(
-            func.pgp_sym_decrypt(OTPCode.email_encrypted, PG_SECRET) == user.email,
-            OTPCode.is_used == False,
-            OTPCode.expires_at > now,
-        ).order_by(OTPCode.created_at.desc()).limit(1)
-    )
-    otp_record = result.scalars().first()
+    # 3. Create directory (absolute path — same as StaticFiles mount)
+    aadhaar_dir = os.path.join(_BASE_DIR, "uploads", "aadhaar")
+    os.makedirs(aadhaar_dir, exist_ok=True)
 
-    if not otp_record:
-        raise HTTPException(
-            status_code=400,
-            detail="Verification session expired. Please click 'Get OTP' again."
-        )
+    # 4. Save files
+    ext_front = front_image.filename.rsplit('.', 1)[-1].lower() or "png"
+    ext_back  = back_image.filename.rsplit('.', 1)[-1].lower()  or "png"
 
-    ref_id = otp_record.otp_code   # The Setu refId stored in the generate step
+    # Store relative path in DB (same format as before)
+    front_rel  = f"uploads/aadhaar/{user_id}_front_{uuid.uuid4().hex}.{ext_front}"
+    back_rel   = f"uploads/aadhaar/{user_id}_back_{uuid.uuid4().hex}.{ext_back}"
+    front_path = os.path.join(_BASE_DIR, front_rel)
+    back_path  = os.path.join(_BASE_DIR, back_rel)
 
-    # 3. Call Setu → Setu verifies OTP with UIDAI
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"{SETU_BASE_URL}/api/v2/aadhaar-validation/aadhaar-otp/verify",
-                headers=_setu_headers(),
-                json={"otp": data.otp.strip(), "refId": ref_id},
-            )
-    except httpx.RequestError as e:
-        print(f"[Setu] Network error during verify: {e}")
-        raise HTTPException(status_code=503, detail="Could not reach verification service. Please try again.")
+    async with aiofiles.open(front_path, 'wb') as out_f:
+        await out_f.write(await front_image.read())
+    async with aiofiles.open(back_path, 'wb') as out_b:
+        await out_b.write(await back_image.read())
 
-    if resp.status_code not in (200, 201):
-        err = resp.json()
-        detail = err.get("message") or err.get("error") or "Invalid OTP. Please check and try again."
-        print(f"[Setu] verify error {resp.status_code}: {err}")
-        raise HTTPException(status_code=400, detail=detail)
+    # 5. Update DB — store the RELATIVE path so the URL stays portable
+    from datetime import timezone as _tz
+    user.aadhaar_front_image = front_rel
+    user.aadhaar_back_image  = back_rel
+    user.aadhaar_manual_status  = "pending_review"
+    user.aadhaar_uploaded_at    = datetime.now(_tz.utc)  # real upload timestamp
 
-    # 4. Success — mark OTP as used and user as verified
-    otp_record.is_used = True
-    user.is_aadhaar_verified = True
     await db.commit()
 
-    print(f"[Setu] ✅ User {user_id} ({user.first_name}) Aadhaar verified successfully via UIDAI.")
-
-    return {
-        "message": "Aadhaar verified successfully! Your profile now shows a verified badge. 🛡️",
-        "is_aadhaar_verified": True
-    }
-
-
-
+    return {"message": "Aadhaar documents uploaded and saved to database successfully."}
+    
 # =====================================================================
 # SELFIE / FACE VERIFICATION
 # =====================================================================
@@ -2995,7 +3052,6 @@ async def get_deactivation_status(
 # =====================================================================
 
 
-
 from crud import (
     create_admin_user,
     authenticate_admin,
@@ -3072,6 +3128,75 @@ async def admin_list_users(
     admin_id: int = Depends(get_current_admin)
 ):
     return await get_all_users_for_admin(db)
+
+
+@app.get("/admin/aadhaar-requests", tags=["Admin System"])
+async def admin_list_aadhaar_requests(
+    db: AsyncSession = Depends(get_db),
+    admin_id: int = Depends(get_current_admin)
+):
+    from models import User
+    from datetime import timezone, timedelta
+
+    IST = timezone(timedelta(hours=5, minutes=30))
+
+    def resolve_img(db_path):
+        """Return the URL path only if the file physically exists on this server.
+        Returns None for missing files so the frontend never makes a 404 request."""
+        if not db_path:
+            return None
+        relative = db_path.lstrip("/")
+        abs_path = os.path.join(_BASE_DIR, relative)
+        if not os.path.exists(abs_path):
+            return None  # File is on another server — suppress the 404
+        return "/" + relative
+
+    # Get all users who have a manual Aadhaar upload record in the database
+    result = await db.execute(
+        select(User).where(
+            or_(
+                User.aadhaar_front_image.isnot(None),
+                User.aadhaar_back_image.isnot(None)
+            )
+        ).order_by(User.id.desc())
+    )
+    users = result.scalars().all()
+
+    out = []
+    for u in users:
+        # ── Date/Time: use aadhaar_uploaded_at (real upload time); fallback to created_at ──
+        raw_dt = u.aadhaar_uploaded_at or u.created_at
+        if raw_dt:
+            if raw_dt.tzinfo is None:
+                dt_ist = raw_dt.replace(tzinfo=timezone.utc).astimezone(IST)
+            else:
+                dt_ist = raw_dt.astimezone(IST)
+            date_str = dt_ist.strftime("%d %b %Y")
+            time_str = dt_ist.strftime("%I:%M %p")
+            uploaded_at_iso = dt_ist.isoformat()
+        else:
+            date_str = "N/A"
+            time_str = ""
+            uploaded_at_iso = None
+
+        # ── Images: only expose URL if file exists locally (stops 404 log spam) ──
+        front_img = resolve_img(u.aadhaar_front_image)
+        back_img = resolve_img(u.aadhaar_back_image)
+
+        out.append({
+            "id": u.id,
+            "user_id": u.id,
+            "user_name": f"{u.first_name} {u.last_name}",
+            "upload_date": date_str,
+            "upload_time": time_str,
+            "uploaded_at": uploaded_at_iso,
+            "aadhaar_front_image": front_img,    # null = file not on this server
+            "aadhaar_back_image": back_img,       # null = file not on this server
+            "front_uploaded": bool(u.aadhaar_front_image),  # user DID upload
+            "back_uploaded": bool(u.aadhaar_back_image),    # user DID upload
+            "aadhaar_manual_status": u.aadhaar_manual_status or "pending_review"
+        })
+    return out
 
 
 @app.get("/admin/users/{user_id}", tags=["Admin System"])

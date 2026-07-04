@@ -11,6 +11,8 @@ from models import User, Message, Referral, Transaction, SupportTicket, BlockedU
 from auth import hash_password, verify_password
 from models import Admin, Report
 from sqlalchemy import func, cast, Date, select
+from models import SupportTicket
+# from sqlalchemy import select # Added for admin 
 PG_SECRET = os.getenv("PG_SECRET_KEY", "Apnashaadi.in123")
 
 # crud.py (Update your sanitize_user_dict function)
@@ -407,8 +409,10 @@ _credit_coins = _credit_coins
 async def create_support_ticket(db: AsyncSession, email: str, subject: str, category: str, urgency: str, issue: str) -> SupportTicket:
     user = await get_user_by_email(db, email)
     email_verified = user is not None
+    user_id = user.id if user else None
 
     ticket = SupportTicket(
+        user_id=user_id,
         email_encrypted=func.pgp_sym_encrypt(email.lower().strip(), PG_SECRET),
         subject=subject, category=category,
         urgency=urgency, issue=issue, email_verified=email_verified,

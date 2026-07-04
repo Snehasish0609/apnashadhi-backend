@@ -32,9 +32,17 @@ class User(Base):
     account_created_by = Column(String, nullable=True)  # NEW: Self / Parents
     terms_accepted = Column(Boolean, default=False, nullable=False, server_default="false")  # NEW
     is_active = Column(Boolean, default=True, nullable=False, server_default="true")  # Auto-activate by default
-    is_aadhaar_verified = Column(Boolean, default=False, nullable=False, server_default="false")
     is_selfie_verified = Column(Boolean, default=False, nullable=False, server_default="false")
     face_embedding = Column(Text, nullable=True)  # JSON array of 128 floats (face-api.js descriptor)
+
+    is_aadhaar_verified = Column(Boolean, default=False, nullable=False, server_default="false")
+    
+    # Store the paths to the uploaded files
+    aadhaar_manual_status = Column(String, default="unverified", server_default="unverified")
+    aadhaar_front_image = Column(String, nullable=True)
+    aadhaar_back_image = Column(String, nullable=True)
+    aadhaar_uploaded_at = Column(DateTime(timezone=True), nullable=True)  # real upload timestamp
+
 
     # Preferences
     preferred_min_age = Column(Integer, nullable=True)
@@ -204,12 +212,14 @@ class SupportTicket(Base):
     __tablename__ = "support_tickets"
 
     id             = Column(Integer, primary_key=True, index=True)
+    user_id        = Column(Integer, ForeignKey("users.id"), nullable=True)  # Links ticket to a registered user
     email_encrypted= Column(LargeBinary, nullable=False) # 🔥 PGCrypto
     subject        = Column(String(500), nullable=False)
     category       = Column(String(100), nullable=False)               # e.g. "Account Help"
     urgency        = Column(String(50),  nullable=False, default="medium")  # low / medium / high
     issue          = Column(Text,        nullable=False)               # description text
     email_verified = Column(Boolean,     nullable=False, default=False) # True if email found in users table
+    admin_reply    = Column(Text, nullable=True)                       # Admin's reply text
     created_at     = Column(DateTime(timezone=True), server_default=func.now())
     
     @property
@@ -298,4 +308,3 @@ class Admin(Base):
     password = Column(String, nullable=False)
     is_superadmin = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
